@@ -20,9 +20,15 @@ dsh plugin --profile web add C:/resource/dsh-llm-quota-retry
 
 Installation links the package into the profile and records it in
 `dsh.profile.bundles`, so the bundle layer is read on every later start. The
-install itself already applies: the profile patch reloads live, the row
-activates, and the bundle reports `enabled` with an active fiber without a host
-restart.
+host row applies without a restart: the profile patch reloads live, the row
+activates, and the bundle reports `enabled` with an active fiber.
+
+**The composer chip needs one host restart the first time.** The `dsh.client`
+manifest is read by the client-module scan, which caches its verdict per
+package for the lifetime of the host — a package first scanned before it
+declared `dsh.client` stays cached as "not a client package", and no later
+rescan clears that entry. Restart `dsh web` once after installing, or after
+adding `dsh.client` to an already-installed package, and the chip appears.
 
 ## Composition order
 
@@ -211,8 +217,10 @@ roots, so an edit to either host file replaces the module generation in a
 running host: the plugin is disposed and re-imported, and `apply()` re-runs.
 The in-memory retry state does not survive that — a reload drops a pending wait
 and its entry, exactly as a restart does. The durable per-session switch does
-survive, because it lives in the storage domain. The client half is served as a
-dynamic bundle and is picked up on a page refresh.
+survive, because it lives in the storage domain. Editing `client.js` of an
+already-registered client row is picked up as a new artifact generation; only
+adding or changing the `dsh.client` manifest itself needs a restart, because
+the client-module scan caches that verdict per package.
 
 ## Probe
 
@@ -224,8 +232,15 @@ and projection value without a Harness:
 node probe/probe.mjs
 ```
 
-The probe covers the policy end to end, but it cannot produce a provider
-response that reports an exhausted quota. Confirming the composed behavior
-against a real provider requires either an account that actually runs out of
-balance or an OpenAI-compatible endpoint that answers `402` with
-insufficient-balance wording.
+`probe/client-probe.mjs` loads the composer half through a stub module loader
+and checks its slot registration, dictionary, menu contents, selected option,
+and the exact `/quota-retry` line it submits:
+
+```sh
+node probe/client-probe.mjs
+```
+
+Neither probe can produce a provider response that reports an exhausted quota.
+Confirming the composed behavior against a real provider requires either an
+account that actually runs out of balance or an OpenAI-compatible endpoint that
+answers `402` with insufficient-balance wording.
