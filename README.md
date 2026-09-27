@@ -18,8 +18,11 @@ in that profile's composition:
 dsh plugin --profile web add C:/resource/dsh-llm-quota-retry
 ```
 
-A freshly linked package needs one host restart before the Loader can resolve
-its row; after that, both the row and the source files hot-reload.
+Installation links the package into the profile and records it in
+`dsh.profile.bundles`, so the bundle layer is read on every later start. The
+install itself already applies: the profile patch reloads live, the row
+activates, and the bundle reports `enabled` with an active fiber without a host
+restart.
 
 ## Composition order
 
@@ -141,6 +144,14 @@ export function apply(ctx) {
   and the plugin writes no session events, so it adds no log vocabulary that
   another build would have to know.
 
+## Hot reload
+
+`index.js` and `lib/policy.js` are listed in the profile's `hmr` roots, so an
+edit replaces the module generation in a running host: the plugin is disposed
+and re-imported, and `apply()` re-runs. The in-memory retry state does not
+survive that — a reload drops a pending wait and its entry, exactly as a
+restart does.
+
 ## Probe
 
 `probe/probe.mjs` drives `apply()` against a fake Cordis context and checks
@@ -149,3 +160,9 @@ every decision, event, and state transition without a Harness:
 ```sh
 node probe/probe.mjs
 ```
+
+The probe covers the policy end to end, but it cannot produce a provider
+response that reports an exhausted quota. Confirming the composed behavior
+against a real provider requires either an account that actually runs out of
+balance or an OpenAI-compatible endpoint that answers `402` with
+insufficient-balance wording.
