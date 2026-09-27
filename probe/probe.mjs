@@ -10,7 +10,7 @@
 
 import assert from 'node:assert/strict'
 import { apply } from '../index.js'
-import { QUOTA_EXCEEDED_CODE, resolvePolicy } from '../lib/policy.js'
+import { QUOTA_EXCEEDED_CODE, isExhaustedAllowanceFailure, resolvePolicy } from '../lib/policy.js'
 
 /** Minimal `ctx.sessionProjections` surface the plugin registers against. */
 function createProjectionRegistry() {
@@ -210,6 +210,19 @@ check('config validation rejects unknown keys, invalid intervals, and non-boolea
   })
 })
 
+check('only an exhausted allowance triggers long-term retry', () => {
+  assert.equal(isExhaustedAllowanceFailure({ message: 'insufficient balance', code: QUOTA_EXCEEDED_CODE }), true)
+  assert.equal(isExhaustedAllowanceFailure({
+    message: `403 {"error":{"type":"permission_error","message":"You've reached your 5-hour usage limit. `
+      + 'Your quota will reset when the current 5-hour window ends."}}',
+    code: 'AUTH',
+  }), true)
+  assert.equal(isExhaustedAllowanceFailure({ message: 'HTTP 403: permission denied', code: 'AUTH' }), false)
+  assert.equal(isExhaustedAllowanceFailure({ message: '401: Invalid API-key provided.', code: 'AUTH' }), false)
+  assert.equal(isExhaustedAllowanceFailure({ message: 'slow down', code: 'RATE_LIMIT' }), false)
+  assert.equal(isExhaustedAllowanceFailure({ code: 'AUTH' }), false)
+})
+
 check('a non-quota failure delegates and records no state', async () => {
   const context = createContext()
   apply(context, { longTermDelayMs: 5, defaultEnabled: true })
@@ -238,6 +251,32 @@ check('an opted-in session waits the configured interval and returns a retry dec
   const decision = await dispatchFailure(context, request)
   assert.deepEqual(decision, { kind: 'retry' })
   assert.ok(Date.now() - started >= 20, 'the wait must elapse before the retry decision')
+})
+
+check('an AUTH failure naming a spent allowance retries, and a rejected key does not', async () => {
+  const allowance = {
+    ...request,
+    failure: {
+      message: `403 {"error":{"type":"permission_error","message":"You've reached your 5-hour usage limit."}}`,
+      code: 'AUTH',
+    },
+  }
+  const context = createContext()
+  apply(context, { longTermDelayMs: 5, defaultEnabled: true })
+  assert.deepEqual(await dispatchFailure(context, allowance), { kind: 'retry' })
+  const state = context.service.stateOf(session)
+  assert.equal(state.attempts, 1)
+  assert.equal(enteredOf(context)[0].payload.failure, allowance.failure)
+
+  const rejected = createContext()
+  apply(rejected, { longTermDelayMs: 5, defaultEnabled: true })
+  const delegated = await dispatchFailure(rejected, {
+    ...request,
+    failure: { message: '401: Invalid API-key provided.', code: 'AUTH' },
+  })
+  assert.equal(delegated, undefined)
+  assert.equal(rejected.service.isRetrying(session), false)
+  assert.equal(rejected.emitted.length, 0)
 })
 
 check('entering announces the interval, provider, and attempt count once', async () => {

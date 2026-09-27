@@ -9,6 +9,8 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createContext as createVmContext, runInContext } from 'node:vm'
 
 /** One registered dynamic module, captured by the stub loader. */
 let module_ = null
@@ -209,6 +211,30 @@ check('submitting before the session is materialized reports it', async () => {
   factoryResult.apply(context)
   const { setEnabled } = context.registrations[0].options.inject('probe-session')
   await assert.rejects(() => setEnabled('on'), /not materialized yet/)
+})
+
+check('the bundle declares nothing where the concatenated batch shares one scope', () => {
+  const source = readFileSync(new URL('../client.js', import.meta.url), 'utf8')
+  const stub = () => ({ window: { __ModuleLoader__: { load() {} } } })
+
+  // A composer bundle that declares a top-level name hands it to every other
+  // bundle in the same batch. Two bundles declaring one name is a SyntaxError
+  // that fails the whole batch, so the bundle must evaluate twice in a row.
+  const batch = createVmContext(stub())
+  assert.doesNotThrow(
+    () => runInContext(`${source}\n${source}`, batch, { filename: 'client.js x2' }),
+    'two copies of the bundle must share one concatenated batch scope',
+  )
+
+  // Names the sibling composer bundle also declares: the exact pair that
+  // failed the Web batch once already.
+  const context = createVmContext(stub())
+  runInContext(source, context, { filename: 'client.js' })
+  const shared = ['NS', 'zh', 'en', 'ON_OPTION', 'OFF_OPTION', 'DEFAULT_OPTION', 'ERROR_OPTION', 'STEP_PERCENTS']
+  for (const name of shared) {
+    assert.equal(runInContext(`typeof ${name}`, context), 'undefined',
+      `client.js leaked the top-level binding ${name} into the shared batch scope`)
+  }
 })
 
 for (const { name, run } of checks) {

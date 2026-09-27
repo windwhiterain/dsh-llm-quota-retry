@@ -1,11 +1,12 @@
 /**
  * Long-term quota recovery for the agent loop's failed-request extension point.
  *
- * A model request that fails with the canonical quota code keeps its open step
- * alive with one further attempt per configured interval — one hour by
- * default, without an attempt limit. The path is strictly additive: every
- * non-quota failure delegates unchanged, and a quarantine failure delegates
- * unchanged too unless the session's switch is on. Earlier recovery policies
+ * A model request that fails because the account is out of allowance keeps its
+ * open step alive with one further attempt per configured interval — one hour
+ * by default, without an attempt limit. That covers the canonical quota code
+ * and an `AUTH` failure whose text names a spent usage limit, because a
+ * provider that meters a rolling window reports exhaustion as a 403 permission
+ * error. Every other failure delegates unchanged. Earlier recovery policies
  * keep their own behavior, so compose this row after
  * `@deepseek-ai/dsh-llm-retry` and its normal-mode retries for eligible codes
  * run first, delegating here only once its budget is spent.
@@ -28,10 +29,10 @@
  */
 
 import {
-  QUOTA_EXCEEDED_CODE,
   QuotaRetryLedger,
   cancellableDelay,
   effectiveEnabled,
+  isExhaustedAllowanceFailure,
   isSuccessfulResponse,
   normalizeSettingRecord,
   parseRetryCommand,
@@ -206,7 +207,7 @@ export function apply(ctx, config = {}) {
   }
 
   const disposeRequestError = ctx.on('agent/request-error', (payload, next) => {
-    if (payload.failure.code !== QUOTA_EXCEEDED_CODE) return next()
+    if (!isExhaustedAllowanceFailure(payload.failure)) return next()
     // A waterfall may have captured this callback before its registration was
     // removed; lifetime cancellation must keep that stale callback from
     // scheduling a wait after disposal.

@@ -3,12 +3,18 @@
 A DeepSeek Harness host plugin that keeps an agent step alive through an
 exhausted account quota or balance.
 
-When a model request fails with the canonical `QUOTA` code, the ordinary
-recovery policy gives up once its retry budget is spent and the turn ends. For
-a session that has opted in, this plugin takes over at that point and retries
-the same request inside the same open turn once per configured interval — one
-hour by default, with no attempt limit — until a request succeeds or the turn
-is cancelled.
+When a model request fails because the account is out of allowance, the
+ordinary recovery policy gives up once its retry budget is spent and the turn
+ends. For a session that has opted in, this plugin takes over at that point and
+retries the same request inside the same open turn once per configured interval
+— one hour by default, with no attempt limit — until a request succeeds or the
+turn is cancelled.
+
+That covers two shapes of the same condition: the canonical `QUOTA` code, and
+an `AUTH` failure whose text names a spent usage limit. The second shape is how
+a provider that meters a rolling window answers — a 403 permission error whose
+body says the allowance is used up and will reset — and a plugin that keyed on
+`QUOTA` alone would miss exactly the case it exists for.
 
 ## Install
 
@@ -44,24 +50,27 @@ bundle install lands in the right place automatically.
 
 ## What this plugin does not touch
 
-The plugin is strictly additive for every failure code except `QUOTA`, and for
-`QUOTA` too until a session opts in:
+The plugin is strictly additive for every failure except an exhausted
+allowance, and for that too until a session opts in:
 
-- **Non-quota failures always delegate unchanged** — rate limits, server
-  errors, timeouts, transports, and context overflows keep their ordinary
-  handling, including compaction's own recovery.
-- **A session that has not opted in delegates its quota failures unchanged.**
-  This is the default.
+- **Every other failure delegates unchanged** — rate limits, server errors,
+  timeouts, transports, and context overflows keep their ordinary handling,
+  including compaction's own recovery. So does a credential the provider will
+  keep rejecting: only an `AUTH` failure whose text names a spent allowance is
+  treated as one, so a wrong or revoked API key still fails fast instead of
+  waiting an hour between attempts that cannot succeed.
+- **A session that has not opted in delegates an exhausted allowance
+  unchanged.** This is the default.
 - **The native quick retry is never removed.** `dsh-llm-retry` still runs
   first and its configured `retryPolicy` still governs. Note that `QUOTA` is
-  not in the default `retryableCodes`, so by default a quota failure triggers
-  no native retry at all and this plugin is the only thing that answers it;
-  a provider that lists `QUOTA` (or runs `mode: always`) keeps its own
-  retries, and this plugin wakes up only after they are spent.
+  not in the default `retryableCodes`, so by default an exhausted allowance
+  triggers no native retry at all and this plugin is the only thing that
+  answers it; a provider that lists `QUOTA` (or runs `mode: always`) keeps its
+  own retries, and this plugin wakes up only after they are spent.
 - **One configuration is superseded rather than merely left alone.**
   `retryPolicy.mode: always` has no eligible-code list and no budget, and it
-  asks downstream first, so for `QUOTA` the hourly schedule replaces its own
-  sub-minute backoff. Every other configuration is untouched.
+  asks downstream first, so for an exhausted allowance the hourly schedule
+  replaces its own sub-minute backoff. Every other configuration is untouched.
 
 ## The per-session switch
 
@@ -190,8 +199,10 @@ export function apply(ctx) {
 
 ## Behavior and limits
 
-- **Only the canonical `QUOTA` code is observed.** Every other failure
-  delegates to the next listener unchanged.
+- **The trigger is an exhausted allowance.** The canonical `QUOTA` code always
+  counts; an `AUTH` failure counts only when its text names a spent usage
+  limit, balance, or credits. Everything else reaches the next listener
+  untouched.
 - **The session stays busy.** A long-term wait holds the open step, so the turn
   does not reach quiescence and the session reports as running until a request
   succeeds or the turn is cancelled.
@@ -206,6 +217,12 @@ export function apply(ctx) {
   projections recompute on session events, and the retry state changes between
   them, so a live "retrying now" badge would be up to an hour stale. Use the
   service or the two events for live progress.
+- **The `AUTH` wording check compensates for the harness.** A Harness release
+  that classifies a spent rolling allowance as `QUOTA` — which
+  `@deepseek-ai/dsh-llm` does as of the `fix(llm): classify a spent usage
+  allowance as quota, not auth` change — needs no wording check at all; this
+  plugin keeps one so it also works against an older host, and the check simply
+  never fires there.
 - **It consumes no model-visible context.** Nothing here reaches the model, and
   the plugin writes no session events, so it adds no log vocabulary that
   another build would have to know.
@@ -221,6 +238,19 @@ survive, because it lives in the storage domain. Editing `client.js` of an
 already-registered client row is picked up as a new artifact generation; only
 adding or changing the `dsh.client` manifest itself needs a restart, because
 the client-module scan caches that verdict per package.
+
+## Client bundle scope
+
+The shell concatenates every dynamic client bundle of a batch into **one
+classic script**, so a top-level declaration in `client.js` joins the same
+lexical scope as every other bundle's. A name two bundles both declare is a
+`SyntaxError` that fails the whole batch, which takes down every composer
+contribution in it — not just this one.
+
+`client.js` therefore declares nothing at the top level: a single IIFE owns
+every name and only the `window.__ModuleLoader__.load(...)` call inside it
+reaches the shell. `probe/client-probe.mjs` enforces this by evaluating the
+bundle twice into one scope, which is exactly what a batch does.
 
 ## Probe
 

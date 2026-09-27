@@ -12,6 +12,12 @@
  * so the bundle route and the module-table identity agree.
  */
 
+// A combo batch concatenates every plugin bundle into one classic script, so a
+// top-level declaration here shares one lexical scope with every other
+// bundle's. A name two bundles both declare is a SyntaxError that takes the
+// whole batch down, so this bundle declares nothing at the top level: the IIFE
+// owns every name, and only the `load` call inside it reaches the shell.
+;(function () {
 /** Option id that turns long-term retry on for this Session. */
 const ON_OPTION = 'on'
 
@@ -228,3 +234,4 @@ window.__ModuleLoader__.load({
     }
   },
 })
+})()
