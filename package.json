@@ -1,6 +1,6 @@
 {
   "name": "dsh-llm-quota-retry",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Keep a DeepSeek Harness agent step alive through an exhausted account quota: after the base provider retry policy gives up on a QUOTA failure, retry the same request once per hour without an attempt limit, and publish the entering, leaving, and current state of that long-term retry to other plugins.",
@@ -16,12 +16,14 @@
   "license": "MIT",
   "exports": {
     ".": "./index.js",
+    "./client": "./client.js",
     "./policy": "./lib/policy.js",
     "./package.json": "./package.json",
     "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "index.js",
+    "client.js",
     "lib/policy.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -30,6 +32,12 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
     }
   },
   "meta": {
