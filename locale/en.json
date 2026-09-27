@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Quota Long-Term Retry",
+    "description": "Retries a model request once per hour, without an attempt limit, while the provider reports an exhausted quota or balance."
+  }
+}

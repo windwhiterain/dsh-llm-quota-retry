@@ -1,0 +1,9 @@
+# Bundle layer for dsh-llm-quota-retry.
+#
+# The row is appended to the composition root, after every row the base bundle
+# contributed — including `@deepseek-ai/dsh-llm-retry`. That order is the
+# contract: a quota failure reaches this listener only after every earlier
+# recovery policy has spent its budget and delegated.
+- insert:
+    - id: llm-quota-retry
+      name: 'dsh-llm-quota-retry'
