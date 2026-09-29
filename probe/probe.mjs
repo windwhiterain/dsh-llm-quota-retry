@@ -10,7 +10,7 @@
 
 import assert from 'node:assert/strict'
 import { apply } from '../index.js'
-import { QUOTA_EXCEEDED_CODE, isExhaustedAllowanceFailure, resolvePolicy } from '../lib/policy.js'
+import { DEFAULT_ENABLED, QUOTA_EXCEEDED_CODE, isExhaustedAllowanceFailure, resolvePolicy } from '../lib/policy.js'
 
 /** Minimal `ctx.sessionProjections` surface the plugin registers against. */
 function createProjectionRegistry() {
@@ -203,10 +203,11 @@ check('config validation rejects unknown keys, invalid intervals, and non-boolea
   assert.throws(() => resolvePolicy({ longTermDelayMs: 2_147_483_648 }), /no greater than 2147483647/)
   assert.throws(() => resolvePolicy({ defaultEnabled: 'yes' }), /defaultEnabled must be a boolean/)
   assert.throws(() => resolvePolicy({ quickRetries: 3 }), /unknown config key "quickRetries"/)
-  assert.deepEqual(resolvePolicy({}), { longTermDelayMs: 3_600_000, defaultEnabled: false })
-  assert.deepEqual(resolvePolicy({ longTermDelayMs: 1000, defaultEnabled: true }), {
+  assert.equal(DEFAULT_ENABLED, true, 'a session that owns no setting starts on')
+  assert.deepEqual(resolvePolicy({}), { longTermDelayMs: 3_600_000, defaultEnabled: true })
+  assert.deepEqual(resolvePolicy({ longTermDelayMs: 1000, defaultEnabled: false }), {
     longTermDelayMs: 1000,
-    defaultEnabled: true,
+    defaultEnabled: false,
   })
 })
 
@@ -251,16 +252,16 @@ check('a non-quota failure delegates and records no state', async () => {
   assert.equal(context.emitted.length, 0)
 })
 
-check('a session that has not opted in delegates its quota failure too', async () => {
+check('a session whose switch is off delegates its quota failure too', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 5 })
+  apply(context, { longTermDelayMs: 5, defaultEnabled: false })
   const delegated = await dispatchFailure(context, request)
   assert.equal(delegated, undefined)
   assert.equal(context.service.isRetrying(session), false)
   assert.equal(context.emitted.length, 0)
 })
 
-check('an opted-in session waits the configured interval and returns a retry decision', async () => {
+check('an enabled session waits the configured interval and returns a retry decision', async () => {
   const context = createContext()
   apply(context, { longTermDelayMs: 20, defaultEnabled: true })
   const started = Date.now()
@@ -416,24 +417,24 @@ check('a later quota failure after recovery announces entry again', async () => 
 })
 
 check('the switch starts from the deployment default and the projection reports it', async () => {
-  const off = createContext()
-  apply(off, { longTermDelayMs: 5 })
-  assert.deepEqual(off.projections.view(session), { enabled: false, defaultEnabled: false, source: 'default' })
-  off.parents.set('probe-session', 'no-such-parent')
   const on = createContext()
-  apply(on, { longTermDelayMs: 5, defaultEnabled: true })
+  apply(on, { longTermDelayMs: 5 })
   assert.deepEqual(on.projections.view(session), { enabled: true, defaultEnabled: true, source: 'default' })
+  const off = createContext()
+  apply(off, { longTermDelayMs: 5, defaultEnabled: false })
+  off.parents.set('probe-session', 'no-such-parent')
+  assert.deepEqual(off.projections.view(session), { enabled: false, defaultEnabled: false, source: 'default' })
 })
 
-check('/quota-retry on and off move the switch and the projection follows', async () => {
+check('/quota-retry off and on move the switch and the projection follows', async () => {
   const context = createContext()
   apply(context, { longTermDelayMs: 5 })
-  const enable = await context.commands.run(agent, 'on')
-  assert.equal(enable.kind, 'success')
-  assert.deepEqual(context.projections.view(session), { enabled: true, defaultEnabled: false, source: 'session' })
   const disable = await context.commands.run(agent, 'off')
   assert.equal(disable.kind, 'success')
-  assert.deepEqual(context.projections.view(session), { enabled: false, defaultEnabled: false, source: 'session' })
+  assert.deepEqual(context.projections.view(session), { enabled: false, defaultEnabled: true, source: 'session' })
+  const enable = await context.commands.run(agent, 'on')
+  assert.equal(enable.kind, 'success')
+  assert.deepEqual(context.projections.view(session), { enabled: true, defaultEnabled: true, source: 'session' })
 })
 
 check('/quota-retry default restores the deployment default, and status reports it', async () => {
@@ -473,7 +474,7 @@ check('turning the switch off aborts the pending wait and ends the entry as disa
 
 check('a forked session inherits its nearest ancestor\'s explicit setting once', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 5 })
+  apply(context, { longTermDelayMs: 5, defaultEnabled: false })
   const grandparent = { id: 'grandparent-session', header: { id: 'grandparent-session' } }
   await context.commands.run({ session: grandparent }, 'on')
   context.parents.set('parent-session', 'grandparent-session')
@@ -490,20 +491,20 @@ check('an explicit setting survives a host restart through the storage domain', 
   const store = new Map()
   const parents = new Map()
   const first = createContext({ store, parents, withStorage: true })
-  apply(first, { longTermDelayMs: 5 })
+  apply(first, { longTermDelayMs: 5, defaultEnabled: false })
   await first.commands.run(agent, 'on')
   await settled()
   assert.equal(store.get('probe-session').enabled, true)
 
   const second = createContext({ store, parents, withStorage: true })
-  apply(second, { longTermDelayMs: 5 })
+  apply(second, { longTermDelayMs: 5, defaultEnabled: false })
   await settled()
   assert.deepEqual(second.projections.view(session), { enabled: true, defaultEnabled: false, source: 'session' })
 })
 
 check('without a storage domain the setting stays in the process', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 5 })
+  apply(context, { longTermDelayMs: 5, defaultEnabled: false })
   await context.commands.run(agent, 'on')
   assert.deepEqual(context.projections.view(session), { enabled: true, defaultEnabled: false, source: 'session' })
 })

@@ -12,7 +12,8 @@
  * normal-mode retries for eligible codes run first, delegating here only once
  * its budget is spent.
  *
- * Long-term retry is per Session and off by default. The switch is durable
+ * Long-term retry is per Session and on by default, so an exhausted allowance
+ * is waited out without a per-Session opt-in. The switch is durable
  * (`llm_quota_retry` storage domain), written through `/quota-retry`, and
  * published to the Web composer as the `quotaRetry` Session projection. A
  * forked or delegated Session takes its nearest ancestor's explicit setting
@@ -67,8 +68,9 @@ const PASSTHROUGH_SCHEMA = { parse: value => value }
  * @param ctx - plugin context that owns the listeners, the published service,
  *   the durable settings, and the active waits.
  * @param config - row config: `longTermDelayMs` sets the interval between
- *   attempts and `defaultEnabled` sets the switch a Session starts from.
- *   Unknown keys and invalid values throw at activation.
+ *   attempts and `defaultEnabled` sets the switch a Session starts from, on
+ *   unless the row turns it off. Unknown keys and invalid values throw at
+ *   activation.
  */
 export function apply(ctx, config = {}) {
   const policy = resolvePolicy(config)

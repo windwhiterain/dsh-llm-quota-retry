@@ -5,10 +5,12 @@ exhausted account quota or balance.
 
 When a model request fails because the account is out of allowance, the
 ordinary recovery policy gives up once its retry budget is spent and the turn
-ends. For a session that has opted in, this plugin takes over at that point and
-retries the same request inside the same open turn once per configured interval
-— one hour by default, with no attempt limit — until a request succeeds or the
-turn is cancelled.
+ends. This plugin takes over at that point and retries the same request inside
+the same open turn once per configured interval — one hour by default, with no
+attempt limit — until a request succeeds or the turn is cancelled. It is on by
+default for every session: turn it off per session through the
+[composer chip or `/quota-retry`](#the-per-session-switch), or for the whole
+deployment with `defaultEnabled: false`.
 
 That covers three shapes of the same condition: the canonical `QUOTA` code, and
 an `AUTH` or `RATE_LIMIT` failure whose text names a spent usage limit. The
@@ -52,7 +54,7 @@ bundle install lands in the right place automatically.
 ## What this plugin does not touch
 
 The plugin is strictly additive for every failure except an exhausted
-allowance, and for that too until a session opts in:
+allowance, and for that too in every session whose switch is off:
 
 - **Every other failure delegates unchanged** — rate limits, server errors,
   timeouts, transports, and context overflows keep their ordinary handling,
@@ -62,8 +64,8 @@ allowance, and for that too until a session opts in:
   or revoked API key still fails fast and a burst of concurrent requests still
   keeps its sub-minute retries, instead of either waiting an hour between
   attempts that cannot succeed.
-- **A session that has not opted in delegates an exhausted allowance
-  unchanged.** This is the default.
+- **A session whose switch is off delegates an exhausted allowance
+  unchanged.** Turning the switch off is the opt-out; every session starts on.
 - **The native quick retry is never removed.** `dsh-llm-retry` still runs
   first and its configured `retryPolicy` still governs. Note that `QUOTA` is
   not in the default `retryableCodes`, so by default an exhausted allowance
@@ -77,7 +79,7 @@ allowance, and for that too until a session opts in:
 
 ## The per-session switch
 
-Long-term retry is **off until a session turns it on**. Three paths move the
+Long-term retry is **on until the switch is turned off**. Three paths move the
 same switch:
 
 - **Composer chip** — beside the model, permission, and compaction chips, with
@@ -88,10 +90,11 @@ same switch:
   storage domain, so it survives a host restart. Without a usable storage
   domain it degrades to a process-local value instead of failing the switch.
 
-A session with no record of its own follows `defaultEnabled`. A forked or
-delegated session takes its nearest ancestor's explicit setting once, as a
-snapshot: the value applies to that session from then on, and `default` clears
-it back to the deployment default rather than re-inheriting.
+A session with no record of its own follows `defaultEnabled`, which is `true`
+unless the row sets it to `false`. A forked or delegated session takes its
+nearest ancestor's explicit setting once, as a snapshot: the value applies to
+that session from then on, and `default` clears it back to the deployment
+default rather than re-inheriting.
 
 Turning the switch **off** while a session is waiting ends the entry
 immediately — the pending timer is aborted rather than left to wake an hour
@@ -102,17 +105,20 @@ later — and reports `left` with reason `disabled`.
 | Key | Default | Meaning |
 |---|---|---|
 | `longTermDelayMs` | `3600000` | Interval between long-term attempts, in milliseconds. Must be a positive finite number no greater than `2147483647`. |
-| `defaultEnabled` | `false` | The switch a session starts from before it owns a setting of its own. |
+| `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes long-term retry opt-in. |
 
 Unknown keys and invalid values throw at activation, so a misconfigured row
 fails loudly instead of silently retrying on a wrong schedule.
+
+A row that turns the default off makes long-term retry opt-in for the whole
+deployment; the row below also shortens the interval.
 
 ```yaml
 - id: llm-quota-retry
   name: 'dsh-llm-quota-retry'
   config:
     longTermDelayMs: 1800000
-    defaultEnabled: true
+    defaultEnabled: false
 ```
 
 ## Reading the state from another plugin
