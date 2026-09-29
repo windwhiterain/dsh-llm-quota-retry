@@ -4,12 +4,13 @@
  * A model request that fails because the account is out of allowance keeps its
  * open step alive with one further attempt per configured interval — one hour
  * by default, without an attempt limit. That covers the canonical quota code
- * and an `AUTH` failure whose text names a spent usage limit, because a
- * provider that meters a rolling window reports exhaustion as a 403 permission
- * error. Every other failure delegates unchanged. Earlier recovery policies
- * keep their own behavior, so compose this row after
- * `@deepseek-ai/dsh-llm-retry` and its normal-mode retries for eligible codes
- * run first, delegating here only once its budget is spent.
+ * and an `AUTH` or `RATE_LIMIT` failure whose text names a spent usage limit,
+ * because a provider that meters a rolling window reports exhaustion as a 403
+ * permission error and a Token Plan provider reports it as a 429. Every other
+ * failure delegates unchanged. Earlier recovery policies keep their own
+ * behavior, so compose this row after `@deepseek-ai/dsh-llm-retry` and its
+ * normal-mode retries for eligible codes run first, delegating here only once
+ * its budget is spent.
  *
  * Long-term retry is per Session and off by default. The switch is durable
  * (`llm_quota_retry` storage domain), written through `/quota-retry`, and

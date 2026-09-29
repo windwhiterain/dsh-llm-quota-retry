@@ -223,6 +223,22 @@ check('only an exhausted allowance triggers long-term retry', () => {
   assert.equal(isExhaustedAllowanceFailure({ code: 'AUTH' }), false)
 })
 
+check('a Token Plan 429 naming a spent plan allowance triggers, and ordinary throttling does not', () => {
+  assert.equal(isExhaustedAllowanceFailure({
+    message: '429 {"type":"error","error":{"type":"rate_limit_error","message":"已达到 Token Plan 用量上限：'
+      + '请升级 Token Plan 套餐或购买积分补充用量。 (2056)"},"request_id":"070a9228c3b31a147bf2c735d4a84de8"}',
+    code: 'RATE_LIMIT',
+  }), true)
+  assert.equal(isExhaustedAllowanceFailure({ message: '请求过于频繁，请稍后再试', code: 'RATE_LIMIT' }), false)
+  assert.equal(isExhaustedAllowanceFailure({ message: '账户余额不足，请充值', code: 'RATE_LIMIT' }), true)
+  assert.equal(isExhaustedAllowanceFailure({ message: 'HTTP 429: rate limit reached', code: 'RATE_LIMIT' }), false)
+  // The upgrade advice a Token Plan failure appends must not supply the noun.
+  assert.equal(isExhaustedAllowanceFailure({
+    message: '429 request throttled; upgrade your plan for more quota',
+    code: 'RATE_LIMIT',
+  }), false)
+})
+
 check('a non-quota failure delegates and records no state', async () => {
   const context = createContext()
   apply(context, { longTermDelayMs: 5, defaultEnabled: true })
@@ -277,6 +293,31 @@ check('an AUTH failure naming a spent allowance retries, and a rejected key does
   assert.equal(delegated, undefined)
   assert.equal(rejected.service.isRetrying(session), false)
   assert.equal(rejected.emitted.length, 0)
+})
+
+check('a rate-limit failure naming a spent plan allowance retries, and throttling does not', async () => {
+  const spentPlan = {
+    ...request,
+    failure: {
+      message: '429 {"type":"error","error":{"type":"rate_limit_error","message":"已达到 Token Plan 用量上限：'
+        + '请升级 Token Plan 套餐或购买积分补充用量。 (2056)"}}',
+      code: 'RATE_LIMIT',
+    },
+  }
+  const context = createContext()
+  apply(context, { longTermDelayMs: 5, defaultEnabled: true })
+  assert.deepEqual(await dispatchFailure(context, spentPlan), { kind: 'retry' })
+  assert.equal(enteredOf(context)[0].payload.failure, spentPlan.failure)
+
+  const throttled = createContext()
+  apply(throttled, { longTermDelayMs: 5, defaultEnabled: true })
+  const delegated = await dispatchFailure(throttled, {
+    ...request,
+    failure: { message: '429 request throttled, retry shortly', code: 'RATE_LIMIT' },
+  })
+  assert.equal(delegated, undefined)
+  assert.equal(throttled.service.isRetrying(session), false)
+  assert.equal(throttled.emitted.length, 0)
 })
 
 check('entering announces the interval, provider, and attempt count once', async () => {

@@ -10,11 +10,12 @@ retries the same request inside the same open turn once per configured interval
 — one hour by default, with no attempt limit — until a request succeeds or the
 turn is cancelled.
 
-That covers two shapes of the same condition: the canonical `QUOTA` code, and
-an `AUTH` failure whose text names a spent usage limit. The second shape is how
-a provider that meters a rolling window answers — a 403 permission error whose
-body says the allowance is used up and will reset — and a plugin that keyed on
-`QUOTA` alone would miss exactly the case it exists for.
+That covers three shapes of the same condition: the canonical `QUOTA` code, and
+an `AUTH` or `RATE_LIMIT` failure whose text names a spent usage limit. The
+other two are how metered providers answer — a 403 permission error from one
+that meters a rolling window, a 429 rate limit from one that meters a Token
+Plan (`已达到 Token Plan 用量上限：…`, in Chinese) — and a plugin that keyed on
+`QUOTA` alone would miss exactly the cases it exists for.
 
 ## Install
 
@@ -56,9 +57,11 @@ allowance, and for that too until a session opts in:
 - **Every other failure delegates unchanged** — rate limits, server errors,
   timeouts, transports, and context overflows keep their ordinary handling,
   including compaction's own recovery. So does a credential the provider will
-  keep rejecting: only an `AUTH` failure whose text names a spent allowance is
-  treated as one, so a wrong or revoked API key still fails fast instead of
-  waiting an hour between attempts that cannot succeed.
+  keep rejecting, and so does ordinary throttling: an `AUTH` or `RATE_LIMIT`
+  failure is read as a spent allowance only when its text names one, so a wrong
+  or revoked API key still fails fast and a burst of concurrent requests still
+  keeps its sub-minute retries, instead of either waiting an hour between
+  attempts that cannot succeed.
 - **A session that has not opted in delegates an exhausted allowance
   unchanged.** This is the default.
 - **The native quick retry is never removed.** `dsh-llm-retry` still runs
@@ -200,9 +203,9 @@ export function apply(ctx) {
 ## Behavior and limits
 
 - **The trigger is an exhausted allowance.** The canonical `QUOTA` code always
-  counts; an `AUTH` failure counts only when its text names a spent usage
-  limit, balance, or credits. Everything else reaches the next listener
-  untouched.
+  counts; an `AUTH` or `RATE_LIMIT` failure counts only when its text names a
+  spent usage limit, quota, balance, or credits, in English or Chinese.
+  Everything else reaches the next listener untouched.
 - **The session stays busy.** A long-term wait holds the open step, so the turn
   does not reach quiescence and the session reports as running until a request
   succeeds or the turn is cancelled.
@@ -217,12 +220,14 @@ export function apply(ctx) {
   projections recompute on session events, and the retry state changes between
   them, so a live "retrying now" badge would be up to an hour stale. Use the
   service or the two events for live progress.
-- **The `AUTH` wording check compensates for the harness.** A Harness release
-  that classifies a spent rolling allowance as `QUOTA` — which
-  `@deepseek-ai/dsh-llm` does as of the `fix(llm): classify a spent usage
-  allowance as quota, not auth` change — needs no wording check at all; this
-  plugin keeps one so it also works against an older host, and the check simply
-  never fires there.
+- **The wording checks compensate for the harness.** A Harness release that
+  classifies a spent allowance as `QUOTA` — which `@deepseek-ai/dsh-llm` does
+  as of the `fix(llm): classify a spent usage allowance as quota, not auth`
+  change, for a rolling window a provider reports as a 403 — needs no wording
+  check at all. A Token Plan provider still arrives as `RATE_LIMIT`: that
+  harness classifier reads English wording only, so a Chinese body keeps its
+  429 code and would take its turn down here. The checks keep this plugin
+  correct against both hosts.
 - **It consumes no model-visible context.** Nothing here reaches the model, and
   the plugin writes no session events, so it adds no log vocabulary that
   another build would have to know.
