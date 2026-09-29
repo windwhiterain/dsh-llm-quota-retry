@@ -14,6 +14,15 @@
     "quota"
   ],
   "license": "MIT",
+  "author": "windwhiterain",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/windwhiterain/dsh-llm-quota-retry.git"
+  },
+  "homepage": "https://github.com/windwhiterain/dsh-llm-quota-retry#readme",
+  "bugs": {
+    "url": "https://github.com/windwhiterain/dsh-llm-quota-retry/issues"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",

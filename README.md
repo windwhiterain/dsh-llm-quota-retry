@@ -23,8 +23,10 @@ Plan (`已达到 Token Plan 用量上限：…`, in Chinese) — and a plugin th
 
 The package is a Cordis bundle with a Web composer half:
 
+From the directory that contains your checkout of this repository:
+
 ```sh
-dsh plugin --profile web add C:/resource/dsh-llm-quota-retry
+dsh plugin --profile web add ./dsh-llm-quota-retry
 ```
 
 Installation links the package into the profile and records it in
@@ -240,9 +242,9 @@ export function apply(ctx) {
 
 ## Hot reload
 
-`index.js`, `client.js`, and `lib/policy.js` are listed in the profile's `hmr`
-roots, so an edit to either host file replaces the module generation in a
-running host: the plugin is disposed and re-imported, and `apply()` re-runs.
+Listing `index.js`, `client.js`, and `lib/policy.js` in the profile's `hmr` roots
+makes an edit to either host file replace the module generation in a running
+host: the plugin is disposed and re-imported, and `apply()` re-runs.
 The in-memory retry state does not survive that — a reload drops a pending wait
 and its entry, exactly as a restart does. The durable per-session switch does
 survive, because it lives in the storage domain. Editing `client.js` of an
@@ -285,3 +287,7 @@ Neither probe can produce a provider response that reports an exhausted quota.
 Confirming the composed behavior against a real provider requires either an
 account that actually runs out of balance or an OpenAI-compatible endpoint that
 answers `402` with insufficient-balance wording.
+
+## License
+
+MIT
