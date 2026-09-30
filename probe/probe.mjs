@@ -48,6 +48,37 @@ function createCommandRegistry() {
       assert.ok(definition !== undefined, 'the plugin must register /quota-retry')
       return definition.handler({ agent, rawInput })
     },
+    runNamed(name, rawInput) {
+      const definition = commands.get(name)
+      assert.ok(definition !== undefined, `the plugin must register /${name}`)
+      return definition.handler({ rawInput })
+    },
+  }
+}
+
+/**
+ * Minimal `ctx.subprocess` surface: each spawn answers with the next queued
+ * stdout, so a probe decides what a balance script "printed" without a process.
+ * A queued `null` stands for a script that failed.
+ */
+function createSubprocess(outputs = []) {
+  const spawned = []
+  return {
+    spawned,
+    spawn(spec) {
+      spawned.push(spec)
+      const queued = outputs.length === 0 ? '' : outputs.shift()
+      const failed = queued === null
+      return {
+        done: Promise.resolve({ exitCode: failed ? 3 : 0, signal: null }),
+        collected: {
+          stdout: { readFrom: () => ({ text: failed ? '' : queued, nextOffset: 0, lossy: false }) },
+          stderr: { readFrom: () => ({ text: failed ? 'balance script failed' : '', nextOffset: 0, lossy: false }) },
+        },
+        terminate() {},
+        waitForExit: () => Promise.resolve(true),
+      }
+    },
   }
 }
 
@@ -83,7 +114,7 @@ function createSessionRegistry(parents) {
  * finds its dependency, which is how the probe covers the durable and
  * process-local paths with the same plugin code.
  */
-function createContext({ store = new Map(), parents = new Map(), withStorage = false } = {}) {
+function createContext({ store = new Map(), parents = new Map(), withStorage = false, subprocess = null } = {}) {
   const hooks = new Map()
   const emitted = []
   const cleanups = []
@@ -95,6 +126,7 @@ function createContext({ store = new Map(), parents = new Map(), withStorage = f
     ['sessions', createSessionRegistry(parents)],
   ])
   if (withStorage) services.set('storageDomain', createStorageDomain(store))
+  if (subprocess !== null) services.set('subprocess', subprocess)
 
   function effect(callback) {
     // Cordis runs the callback at registration and keeps its returned disposer.
@@ -162,6 +194,22 @@ async function dispatchFailure(context, payload) {
 /** Deliver one committed Session event to the registered observers. */
 function dispatchSessionEvent(context, session, event) {
   for (const listener of context.hooks.get('session/event') ?? []) listener(session, event)
+}
+
+/**
+ * Run the registered `agent/request` waterfall the way a model request does,
+ * with `proposal` as what the Session would otherwise use.
+ * @param context - the fake context.
+ * @param caller - the Agent making the request.
+ * @param proposal - the provider/model the request resolves to without this plugin.
+ * @returns the config the request goes out with.
+ */
+async function dispatchRequest(context, caller, proposal) {
+  const chain = [...(context.hooks.get('agent/request') ?? [])]
+  const run = index => index >= chain.length
+    ? Promise.resolve(proposal)
+    : chain[index]({ agent: caller }, () => run(index + 1))
+  return run(0)
 }
 
 /** Await the microtask and timer queues, so the storage domain's `open()` settles. */
@@ -517,6 +565,158 @@ check('disposal aborts a pending wait, drops the service, and leaves nothing beh
   await context.dispose()
   assert.equal(await pending, undefined)
   assert.equal(leftOf(context).length, 0)
+})
+
+check('a pooled session moves to a route with allowance and retries at once', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
+    balances: [{ provider: 'second', script: ['probe-script'], minimumRemaining: 1 }],
+  })
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'first', model: 'one' }), {
+    provider: 'first',
+    model: 'one',
+  })
+
+  const started = Date.now()
+  const decision = await dispatchFailure(context, { ...request, provider: 'first' })
+  assert.deepEqual(decision, { kind: 'retry' })
+  assert.ok(Date.now() - started < 1_000, 'a route with allowance is taken now, not after the interval')
+
+  const failover = context.emitted.find(entry => entry.event === 'llm-quota-retry/failover')
+  assert.ok(failover !== undefined, 'the move is announced')
+  assert.equal(failover.payload.from.provider, 'first')
+  assert.equal(failover.payload.to.provider, 'second')
+  assert.equal(failover.payload.pool, 'medium')
+  assert.equal(enteredOf(context).length, 0, 'no long-term entry is opened when a route can take over')
+
+  const after = await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+  assert.deepEqual(after, { provider: 'second', model: 'two' },
+    'the next request of that session is proposed on the replacement route')
+})
+
+check('a pool with nothing usable falls back to the long-term wait', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 15,
+    pools: { medium: { routes: [{ provider: 'only', model: 'solo' }] } },
+  })
+  await dispatchRequest(context, agent, { provider: 'only', model: 'solo' })
+  const started = Date.now()
+  const decision = await dispatchFailure(context, { ...request, provider: 'only' })
+  assert.deepEqual(decision, { kind: 'retry' })
+  assert.ok(Date.now() - started >= 15, 'the interval is what a single-route pool still uses')
+  assert.equal(context.emitted.some(entry => entry.event === 'llm-quota-retry/failover'), false)
+  assert.equal(enteredOf(context).length, 1)
+})
+
+check('the switch off leaves a pooled session on the route it proposed', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 5,
+    defaultEnabled: false,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
+  })
+  await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+  assert.equal(await dispatchFailure(context, { ...request, provider: 'first' }), undefined)
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'first', model: 'one' }), {
+    provider: 'first',
+    model: 'one',
+  }, 'switching the plugin off for a session means it does not move that session')
+})
+
+check('a shared route is not guessed, and assignPool settles it', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: {
+      left: { routes: [{ provider: 'both', model: 'either' }, { provider: 'fallback', model: 'backup' }] },
+      right: { routes: [{ provider: 'both', model: 'either' }, { provider: 'other', model: 'spare' }] },
+    },
+  })
+  await dispatchRequest(context, agent, { provider: 'both', model: 'either' })
+  await dispatchFailure(context, { ...request, provider: 'both' })
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'both', model: 'either' }), {
+    provider: 'both',
+    model: 'either',
+  }, 'two pools claim the route, so neither is applied to a session that named none')
+
+  assert.equal(context.service.assignPool(session, 'left'), true)
+  const moved = await dispatchRequest(context, agent, { provider: 'both', model: 'either' })
+  assert.equal(moved.provider, 'fallback', 'the assigned pool decides, and it skips the exhausted route')
+  assert.equal(context.service.assignPool(session, 'nowhere'), false, 'an unknown pool assigns nothing')
+})
+
+check('pickRoute reads the scripts, then answers in declared order from the cache', async () => {
+  const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 9}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: { medium: { routes: [{ provider: 'low', model: 'l' }, { provider: 'high', model: 'h' }] } },
+    balances: [
+      { provider: 'low', script: ['probe-script'], minimumRemaining: 1 },
+      { provider: 'high', script: ['probe-script'], minimumRemaining: 1 },
+    ],
+  })
+  const chosen = await context.service.pickRoute('medium')
+  assert.deepEqual(chosen, { provider: 'high', model: 'h' },
+    'the route whose script reported no allowance is skipped')
+  assert.equal(scripts.spawned.length, 2, 'both scripts ran')
+  assert.deepEqual(scripts.spawned[0].argv, ['probe-script'])
+
+  await context.service.pickRoute('medium')
+  assert.equal(scripts.spawned.length, 2, 'a reading inside its refresh interval is not probed again')
+  assert.equal(await context.service.pickRoute('unknown-pool'), undefined)
+})
+
+check('a failing balance script costs a reading, not the request', async () => {
+  const scripts = createSubprocess([null])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: { medium: { routes: [{ provider: 'broken', model: 'b' }, { provider: 'other', model: 'o' }] } },
+    balances: [{ provider: 'broken', script: ['probe-script'], minimumRemaining: 1 }],
+  })
+  // A script that fails leaves the provider with no reading, which fail-open
+  // treats as usable: the pool's declared order still answers.
+  const chosen = await context.service.pickRoute('medium')
+  assert.deepEqual(chosen, { provider: 'broken', model: 'b' })
+  assert.equal(context.service.report().length, 1)
+})
+
+check('/quota-routes reports pools, readings, and exhaustion marks', async () => {
+  const scripts = createSubprocess(['{"remaining": 4, "resetsAt": "2026-01-01T00:00:00.000Z"}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: {
+      medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] },
+      empty: { routes: [{ provider: 'third', model: 'three' }] },
+    },
+    balances: [{ provider: 'first', script: ['probe-script'], minimumRemaining: 1, unit: 'percent' }],
+  })
+  await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+  await dispatchFailure(context, { ...request, provider: 'first' })
+
+  const text = (await context.commands.runNamed('quota-routes', '')).text
+  assert.match(text, /pool "medium"/)
+  assert.match(text, /no\s+first\/one — 4, resets 2026-01-01T00:00:00.000Z \[exhausted /)
+  assert.match(text, /ok\s+second\/two — no reading/)
+  assert.match(text, /pool "empty"/)
+  const narrowed = (await context.commands.runNamed('quota-routes', 'empty')).text
+  assert.match(narrowed, /pool "empty"/)
+  assert.equal(/pool "medium"/.test(narrowed), false)
+  assert.match((await context.commands.runNamed('quota-routes', 'nope')).text, /no pool named "nope"; configured pools: medium, empty/)
+})
+
+check('the published service keeps its retry surface and adds the route surface', async () => {
+  const context = createContext()
+  apply(context, { longTermDelayMs: 5 })
+  assert.deepEqual(Object.keys(context.service).sort(), ['assignPool', 'isRetrying', 'pickRoute', 'report', 'stateOf'])
+  assert.deepEqual(context.service.report(), [])
+  assert.equal(await context.service.pickRoute('nothing'), undefined)
+  assert.equal(context.service.assignPool(session, 'nothing'), false)
 })
 
 for (const { name, run } of checks) {

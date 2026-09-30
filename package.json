@@ -34,6 +34,8 @@
     "index.js",
     "client.js",
     "lib/policy.js",
+    "lib/routes.js",
+    "lib/balance.js",
     "cordis.patch.yml",
     "locale/*.json",
     "README.md"

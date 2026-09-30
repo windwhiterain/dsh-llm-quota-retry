@@ -37,7 +37,7 @@ const NS = 'llmQuotaRetry'
 const zh = {
   'chip.on': '额度重试 开',
   'chip.off': '额度重试 关',
-  'menu.heading': '原生快速重试用尽后，每小时重试一次额度不足的请求，不限次数',
+  'menu.heading': '额度不足时自动切到本会话 route pool 里有余额的一条并立刻重试；都没有余额才每小时重试一次，不限次数',
   'option.on': '开启',
   'option.off': '关闭',
   'option.default': '默认（{state}）',
@@ -45,7 +45,7 @@ const zh = {
   'state.on': '开',
   'state.off': '关',
   'note.inherited': '继承自父会话',
-  'mode': '额度不足长期重试：{state}',
+  'mode': '额度不足的处理方式：{state}',
   'error.command': '设置失败：{message}',
   'error.unavailable': '宿主没有提供 /quota-retry 命令',
 }
@@ -54,7 +54,7 @@ const zh = {
 const en = {
   'chip.on': 'Quota retry on',
   'chip.off': 'Quota retry off',
-  'menu.heading': 'After the provider\'s fast retries give up on quota, retry once an hour without a limit',
+  'menu.heading': 'On an exhausted quota, move this session to a route of its pool that has balance and retry at once; wait an hour between attempts only when none has',
   'option.on': 'On',
   'option.off': 'Off',
   'option.default': 'Default ({state})',
@@ -62,7 +62,7 @@ const en = {
   'state.on': 'on',
   'state.off': 'off',
   'note.inherited': 'inherited from the parent session',
-  'mode': 'Long-term retry through an exhausted quota: {state}',
+  'mode': 'Handling an exhausted quota: {state}',
   'error.command': 'The setting was not changed: {message}',
   'error.unavailable': 'This host offers no /quota-retry command',
 }
