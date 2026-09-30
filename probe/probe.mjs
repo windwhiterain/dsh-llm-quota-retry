@@ -48,10 +48,10 @@ function createCommandRegistry() {
       assert.ok(definition !== undefined, 'the plugin must register /quota-retry')
       return definition.handler({ agent, rawInput })
     },
-    runNamed(name, rawInput) {
+    runNamed(name, rawInput, agent = undefined) {
       const definition = commands.get(name)
       assert.ok(definition !== undefined, `the plugin must register /${name}`)
-      return definition.handler({ rawInput })
+      return definition.handler({ agent, rawInput })
     },
   }
 }
@@ -219,7 +219,36 @@ async function settled() {
   await new Promise(resolve => setTimeout(resolve, 0))
 }
 
-const session = { id: 'probe-session', header: { id: 'probe-session' } }
+/** Session events the fake Session recorded, in order. */
+const appended = []
+
+/**
+ * The expected client value for a Session whose route pool is untouched.
+ * @param enabled - the effective retry switch.
+ * @param source - where the switch came from.
+ * @param defaultEnabled - the deployment default.
+ * @param pools - the configured pool names.
+ * @returns the full expected projection value.
+ */
+function switchView(enabled, source, defaultEnabled, pools = []) {
+  return { enabled, defaultEnabled, source, pool: null, poolSource: 'default', pools }
+}
+
+/**
+ * One fake Session.
+ * @param id - the Session id.
+ * @param parent - its direct parent, absent for a top-level Session.
+ * @returns the fake Session.
+ */
+function fakeSession(id, parent) {
+  return {
+    id,
+    header: { id, ...(parent === undefined ? {} : { parentSession: parent }) },
+    append(type, data) { appended.push({ id, type, data }) },
+  }
+}
+
+const session = fakeSession('probe-session')
 const agent = { session }
 const quotaFailure = { message: 'insufficient balance', code: QUOTA_EXCEEDED_CODE }
 const request = {
@@ -468,11 +497,25 @@ check('a later quota failure after recovery announces entry again', async () => 
 check('the switch starts from the deployment default and the projection reports it', async () => {
   const on = createContext()
   apply(on, { longTermDelayMs: 5 })
-  assert.deepEqual(on.projections.view(session), { enabled: true, defaultEnabled: true, source: 'default' })
+  assert.deepEqual(on.projections.view(session), {
+    enabled: true,
+    defaultEnabled: true,
+    source: 'default',
+    pool: null,
+    poolSource: 'default',
+    pools: [],
+  })
   const off = createContext()
   apply(off, { longTermDelayMs: 5, defaultEnabled: false })
   off.parents.set('probe-session', 'no-such-parent')
-  assert.deepEqual(off.projections.view(session), { enabled: false, defaultEnabled: false, source: 'default' })
+  assert.deepEqual(off.projections.view(session), {
+    enabled: false,
+    defaultEnabled: false,
+    source: 'default',
+    pool: null,
+    poolSource: 'default',
+    pools: [],
+  })
 })
 
 check('/quota-retry off and on move the switch and the projection follows', async () => {
@@ -480,10 +523,24 @@ check('/quota-retry off and on move the switch and the projection follows', asyn
   apply(context, { longTermDelayMs: 5 })
   const disable = await context.commands.run(agent, 'off')
   assert.equal(disable.kind, 'success')
-  assert.deepEqual(context.projections.view(session), { enabled: false, defaultEnabled: true, source: 'session' })
+  assert.deepEqual(context.projections.view(session), {
+    enabled: false,
+    defaultEnabled: true,
+    source: 'session',
+    pool: null,
+    poolSource: 'default',
+    pools: [],
+  })
   const enable = await context.commands.run(agent, 'on')
   assert.equal(enable.kind, 'success')
-  assert.deepEqual(context.projections.view(session), { enabled: true, defaultEnabled: true, source: 'session' })
+  assert.deepEqual(context.projections.view(session), {
+    enabled: true,
+    defaultEnabled: true,
+    source: 'session',
+    pool: null,
+    poolSource: 'default',
+    pools: [],
+  })
 })
 
 check('/quota-retry default restores the deployment default, and status reports it', async () => {
@@ -492,7 +549,14 @@ check('/quota-retry default restores the deployment default, and status reports 
   await context.commands.run(agent, 'off')
   const restored = await context.commands.run(agent, 'default')
   assert.equal(restored.kind, 'success')
-  assert.deepEqual(context.projections.view(session), { enabled: true, defaultEnabled: true, source: 'default' })
+  assert.deepEqual(context.projections.view(session), {
+    enabled: true,
+    defaultEnabled: true,
+    source: 'default',
+    pool: null,
+    poolSource: 'default',
+    pools: [],
+  })
   const reported = await context.commands.run(agent, 'status')
   assert.match(reported.text, /long-term quota retry on \(deployment default\)/)
 })
@@ -529,11 +593,11 @@ check('a forked session inherits its nearest ancestor\'s explicit setting once',
   context.parents.set('parent-session', 'grandparent-session')
   context.parents.set('child-session', 'parent-session')
   const child = { id: 'child-session', header: { id: 'child-session', parentSession: 'parent-session' } }
-  assert.deepEqual(context.projections.view(child), { enabled: true, defaultEnabled: false, source: 'inherited' })
+  assert.deepEqual(context.projections.view(child), switchView(true, 'inherited', false))
   // The inherited snapshot is this session's own value, so the origin stays visible.
   const cleared = await context.commands.run({ session: child }, 'default')
   assert.equal(cleared.kind, 'success')
-  assert.deepEqual(context.projections.view(child), { enabled: false, defaultEnabled: false, source: 'default' })
+  assert.deepEqual(context.projections.view(child), switchView(false, 'default', false))
 })
 
 check('an explicit setting survives a host restart through the storage domain', async () => {
@@ -548,14 +612,14 @@ check('an explicit setting survives a host restart through the storage domain', 
   const second = createContext({ store, parents, withStorage: true })
   apply(second, { longTermDelayMs: 5, defaultEnabled: false })
   await settled()
-  assert.deepEqual(second.projections.view(session), { enabled: true, defaultEnabled: false, source: 'session' })
+  assert.deepEqual(second.projections.view(session), switchView(true, 'session', false))
 })
 
 check('without a storage domain the setting stays in the process', async () => {
   const context = createContext()
   apply(context, { longTermDelayMs: 5, defaultEnabled: false })
   await context.commands.run(agent, 'on')
-  assert.deepEqual(context.projections.view(session), { enabled: true, defaultEnabled: false, source: 'session' })
+  assert.deepEqual(context.projections.view(session), switchView(true, 'session', false))
 })
 
 check('disposal aborts a pending wait, drops the service, and leaves nothing behind', async () => {
@@ -647,7 +711,7 @@ check('the switch off leaves a pooled session on the route it proposed', async (
   }, 'switching the plugin off for a session means it does not move that session')
 })
 
-check('a shared route is not guessed, and assignPool settles it', async () => {
+check('a shared route is not guessed, and setPool settles it', async () => {
   const context = createContext()
   apply(context, {
     longTermDelayMs: 60_000,
@@ -663,10 +727,10 @@ check('a shared route is not guessed, and assignPool settles it', async () => {
     model: 'either',
   }, 'two pools claim the route, so neither is applied to a session that named none')
 
-  assert.equal(context.service.assignPool(session, 'left'), true)
+  assert.equal(context.service.setPool(session, 'left'), true)
   const moved = await dispatchRequest(context, agent, { provider: 'both', model: 'either' })
-  assert.equal(moved.provider, 'fallback', 'the assigned pool decides, and it skips the exhausted route')
-  assert.equal(context.service.assignPool(session, 'nowhere'), false, 'an unknown pool assigns nothing')
+  assert.equal(moved.provider, 'fallback', 'the stated pool decides, and it skips the exhausted route')
+  assert.equal(context.service.setPool(session, 'nowhere'), false, 'an unknown pool sets nothing')
 })
 
 check('pickRoute reads the scripts, then answers in declared order from the cache', async () => {
@@ -734,10 +798,14 @@ check('/quota-routes reports pools, readings, and exhaustion marks', async () =>
 check('the published service keeps its retry surface and adds the route surface', async () => {
   const context = createContext()
   apply(context, { longTermDelayMs: 5 })
-  assert.deepEqual(Object.keys(context.service).sort(), ['assignPool', 'isRetrying', 'pickRoute', 'report', 'stateOf'])
+  assert.deepEqual(
+    Object.keys(context.service).sort(),
+    ['isRetrying', 'pickRoute', 'poolOf', 'report', 'setPool', 'stateOf'],
+  )
   assert.deepEqual(context.service.report(), [])
   assert.equal(await context.service.pickRoute('nothing'), undefined)
-  assert.equal(context.service.assignPool(session, 'nothing'), false)
+  assert.equal(context.service.setPool(session, 'nothing'), false)
+  assert.equal(context.service.poolOf(session), undefined)
 })
 
 check('a balance script receives the credential its apiKeyEnv names', async () => {
@@ -799,6 +867,143 @@ check('choosing a route probes only that pool\'s providers', async () => {
   // The first pool's own provider is still unread, so asking for it probes now.
   await context.service.pickRoute('first')
   assert.equal(scripts.spawned.length, 2)
+})
+
+check('/quota-pool states a pool, and the next request moves into it', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
+  })
+  // The session is on a model no pool holds, so nothing moves it until it is pooled.
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'other', model: 'elsewhere' }), {
+    provider: 'other',
+    model: 'elsewhere',
+  })
+  const before = appended.length
+  const outcome = await context.commands.runNamed('quota-pool', 'medium', agent)
+  assert.equal(outcome.kind, 'success')
+  assert.match(outcome.text, /route pool "medium" governs this session/)
+  assert.match(outcome.text, /its next request uses first\/one/)
+  assert.equal(context.projections.view(session).pool, 'medium')
+  assert.equal(context.projections.view(session).poolSource, 'session')
+  // Choosing a pool is choosing to leave the model the session was on.
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'other', model: 'elsewhere' }), {
+    provider: 'first',
+    model: 'one',
+  })
+  assert.deepEqual(appended.slice(before), [{
+    id: 'probe-session',
+    type: 'model/selection',
+    data: { provider: 'first', model: 'one' },
+  }], 'the session records the route a pool chose, so the model picker follows')
+  // The choice was spent: a later request is not re-chosen behind the user.
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'first', model: 'one' }), {
+    provider: 'first',
+    model: 'one',
+  })
+})
+
+check('/quota-pool off stops route moves, and default clears the pool', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
+  })
+  await context.commands.runNamed('quota-pool', 'medium', agent)
+  assert.equal((await context.commands.runNamed('quota-pool', 'off', agent)).kind, 'success')
+  assert.equal(context.projections.view(session).pool, null)
+  assert.equal(context.projections.view(session).poolSource, 'off')
+  // Even an exhausted route is left alone now: the opt-out is the whole response.
+  await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+  assert.deepEqual(await dispatchFailure(context, { ...request, provider: 'first' }), { kind: 'retry' })
+  assert.equal(enteredOf(context).length, 1, 'the exhausted allowance is waited out instead')
+  assert.equal(context.emitted.some(entry => entry.event === 'llm-quota-retry/failover'), false)
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'first', model: 'one' }), {
+    provider: 'first',
+    model: 'one',
+  })
+
+  const back = await context.commands.runNamed('quota-pool', 'default', agent)
+  assert.equal(back.kind, 'success')
+  assert.equal(context.projections.view(session).poolSource, 'default')
+})
+
+check('/quota-pool rejects an unknown pool and reports status', async () => {
+  const context = createContext()
+  apply(context, { longTermDelayMs: 5, pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } } })
+  const bad = await context.commands.runNamed('quota-pool', 'nope', agent)
+  assert.equal(bad.kind, 'error')
+  assert.match(bad.text, /expected one of medium, off, default, or status/)
+  const status = await context.commands.runNamed('quota-pool', 'status', agent)
+  assert.match(status.text, /route pool \(none\) — no pool governs this session/)
+  assert.match(status.text, /configured pools: medium/)
+  await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+  const inferred = await context.commands.runNamed('quota-pool', 'status', agent)
+  assert.match(inferred.text, /route pool "medium" — inferred from the route this session is on/)
+  assert.match(inferred.text, /this session is on first\/one/)
+})
+
+check('a stated pool survives a host restart through the storage domain', async () => {
+  const store = new Map()
+  const parents = new Map()
+  const pools = { medium: { routes: [{ provider: 'first', model: 'one' }] } }
+  const first = createContext({ store, parents, withStorage: true })
+  apply(first, { longTermDelayMs: 5, pools })
+  await first.commands.runNamed('quota-pool', 'medium', agent)
+  await settled()
+  assert.equal(store.get('probe-session').pool, 'medium')
+
+  const second = createContext({ store, parents, withStorage: true })
+  apply(second, { longTermDelayMs: 5, pools })
+  await settled()
+  assert.equal(second.projections.view(session).pool, 'medium')
+  assert.equal(second.projections.view(session).poolSource, 'session')
+})
+
+check('a forked session inherits the pool its nearest ancestor stated', async () => {
+  const context = createContext()
+  apply(context, { longTermDelayMs: 5, pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } } })
+  const parent = fakeSession('parent-session', 'grandparent-session')
+  context.parents.set('child-session', 'parent-session')
+  await context.commands.runNamed('quota-pool', 'medium', { session: parent })
+  const child = fakeSession('child-session', 'parent-session')
+  assert.equal(context.projections.view(child).pool, 'medium')
+  assert.equal(context.projections.view(child).poolSource, 'inherited')
+})
+
+check('a failover records the route it moves to on the session', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
+  })
+  await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+  const before = appended.length
+  assert.deepEqual(await dispatchFailure(context, { ...request, provider: 'first' }), { kind: 'retry' })
+  assert.deepEqual(appended.slice(before), [{
+    id: 'probe-session',
+    type: 'model/selection',
+    data: { provider: 'second', model: 'two' },
+  }], 'the model picker follows the retry')
+})
+
+check('a pool named after a command word fails activation', () => {
+  const context = createContext()
+  assert.throws(
+    () => apply(context, { longTermDelayMs: 5, pools: { off: { routes: [{ provider: 'p', model: 'm' }] } } }),
+    /pool name "off" cannot be used/,
+  )
+  assert.throws(
+    () => apply(context, {
+      longTermDelayMs: 5,
+      pools: {
+        medium: { routes: [{ provider: 'p', model: 'm' }] },
+        auto: { routes: [{ provider: 'p', model: 'm' }] },
+      },
+    }),
+    /pool name "auto" cannot be used/,
+  )
 })
 
 for (const { name, run } of checks) {

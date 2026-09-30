@@ -18,6 +18,12 @@ deployment with `defaultEnabled: false`. Which route has allowance comes from
 [balance scripts](#route-pools-and-balance-sources) and from the providers that
 report exhaustion themselves.
 
+Any session can also be put in a pool by hand — the
+[second composer chip or `/quota-pool`](#the-per-session-route-pool) — and a
+session whose model happens to be pooled follows that pool without being told to.
+A pool's `minimumRemaining` decides which route a session *starts* on; once a
+session is running, only a provider reporting its allowance spent moves it.
+
 That covers three shapes of the same condition: the canonical `QUOTA` code, and
 an `AUTH` or `RATE_LIMIT` failure whose text names a spent usage limit. The
 other two are how metered providers answer — a 403 permission error from one
@@ -116,6 +122,41 @@ default rather than re-inheriting.
 Turning the switch **off** while a session is waiting ends the entry
 immediately — the pending timer is aborted rather than left to wake an hour
 later — and reports `left` with reason `disabled`.
+
+## The per-session route pool
+
+Which pool governs a session is a setting of its own, in the same durable record
+as the switch and with the same inheritance rules. It is written the same two
+ways:
+
+- **Composer chip** — a second chip beside the switch. Its menu lists every
+  configured pool by name, plus Default and Off.
+- **`/quota-pool <pool|off|default|status>`** — the one write path that chip
+  also uses. `status` reports the effective pool, where it came from, and the
+  route the session is on.
+
+Three states, deliberately distinct:
+
+| Setting | What it means |
+|---|---|
+| a pool name | This session belongs to that pool: on an exhausted allowance it may move to another of its routes. |
+| `default` | No pool is stated, so the plugin follows the route the session is on — **a route exactly one pool holds names that pool**. An ordinary session whose model is pooled therefore fails over without being told to; a route two pools share names neither. |
+| `off` | This session never changes provider. An exhausted allowance is waited out where it is, however long that takes. |
+
+**Choosing a pool chooses a route.** The moment a session is put in a pool — by
+the command, by the chip, or by the delegation plugin that created it from a
+pooled template — the plugin picks a route from it (the threshold applies: the
+first route that clears its own `minimumRemaining`) and the session's next
+request uses it, even when the model it is on belongs to no pool. That choice is
+recorded on the session itself, as the `model/selection` event the model picker
+writes, so the Client's picker shows the route actually in use. After that the
+session is only moved again when a provider reports its allowance spent, and a
+model the user picks afterwards is left alone.
+
+A quota failover never changes the **deployment default** for new sessions, even
+though it moves a session the same way the picker would. The picker's own write
+path saves the choice as the default as well; this plugin deliberately does not
+use it.
 
 ## Configuration
 
@@ -253,12 +294,12 @@ allowance — because a route with little left can still be the one that answers
   held behind a balance probe. A reading below a route's threshold does not move
   an open session (see "How a route is chosen"), and a route the user picked in
   the model picker is left alone as soon as it falls outside the session's pool.
-- **Which pool governs a session**: the one a caller assigned it to
-  (`assignPool`), or — when nobody did — the single pool that holds the route the
-  session is on. A route two pools share names neither, so a session is never
-  moved between pools on a guess. A delegation plugin assigns its children's
-  pool at creation, which is what makes a pool name mean the same thing to the
-  delegating session and to its child.
+- **Which pool governs a session**: the one the session states (`/quota-pool`,
+  the chip, or the delegation plugin that created it), or — when it states none —
+  the single pool that holds the route the session is on. A route two pools share
+  names neither, so a session is never moved between pools on a guess. A stated
+  pool is what makes a pool name mean the same thing to a delegating session and
+  to its child.
 - **A new session** can ask for a route before it exists, through `pickRoute`,
   which refreshes the stale readings of **that pool's own providers** first, so a
   pool never probes a provider it cannot use and the wait is bounded by the
@@ -268,6 +309,14 @@ allowance — because a route with little left can still be the one that answers
 
 `/quota-routes [pool]` prints the same state a person needs: each pool, each
 route, its last reading, and its exhaustion mark.
+
+### Pool names
+
+A pool is named by the deployment, with lowercase letters, digits, and hyphens.
+Eight names are refused at activation because `/quota-pool` and the composer menu
+answer them themselves: `status`, `off`, `none`, `disable`, `disabled`,
+`default`, `reset`, `auto`, and `error`. A pool called `off` could never be
+selected, so the row fails loudly instead of defining one nobody can reach.
 
 ## Reading the state from another plugin
 
@@ -307,28 +356,36 @@ const route = await ctx.llmQuotaRetry.pickRoute('medium')
 // route.provider, route.model, route.reasoningEffort?
 
 // Put a session under one pool's care, so a route several pools share is not
-// left to inference. Returns false when the pool does not exist.
-ctx.llmQuotaRetry.assignPool(childSession, 'medium')
+// left to inference. The session's next request moves into the pool. Pass `null`
+// for the opt-out. Returns false when the pool does not exist.
+ctx.llmQuotaRetry.setPool(childSession, 'medium')
+
+// The pool governing a session right now: the one it states, or the one its
+// route belongs to; undefined when none does.
+const pool = ctx.llmQuotaRetry.poolOf(session)
 
 // Every pool, route, reading, and mark — what `/quota-routes` prints.
 const report = ctx.llmQuotaRetry.report()
 ```
 
-`dsh-subagent-templates` is the reference caller: a template names a pool, and
-every child it creates is assigned that pool and starts on the route `pickRoute`
-chose.
+`dsh-subagent-templates` is the reference caller: a template names a pool, its
+child is created on the route `pickRoute` chose, and `setPool` records the pool on
+the child so a failover later knows where it may move to.
 
-**The per-session switch**, as the `quotaRetry` Session projection:
+**The per-session settings**, as the `quotaRetry` Session projection:
 
 ```js
 const facts = ctx.sessionProjections.stateOf(session, 'quotaRetry')
 // facts.enabled        — the effective switch
 // facts.defaultEnabled — the row's configured default
 // facts.source         — 'default' | 'session' | 'inherited'
+// facts.pool           — the pool governing the session, or null
+// facts.poolSource     — 'default' | 'session' | 'inherited' | 'off'
+// facts.pools          — every configured pool name, in configured order
 ```
 
-The projection is the client-visible path, so it is also what the composer chip
-reads.
+The projection is the client-visible path, so it is also what both composer chips
+read.
 
 ## Subscribing to the transitions
 
@@ -418,15 +475,16 @@ export function apply(ctx) {
   an exhaustion mark cannot withdraw it (it must be at least one `refreshMs`
   later), so a script with its own cache cannot bounce a session straight back
   into the route that just refused it.
-- **Route state is in-memory.** Readings, marks, and pool assignments are lost
-  when the host restarts or the row reloads; the next requests re-derive them
-  from the providers' own answers and the next script runs. Only the per-session
-  switch is durable.
+- **Route state is in-memory, the settings are not.** Readings, marks, and the
+  route each session is on are lost when the host restarts or the row reloads;
+  the next requests re-derive them from the providers' own answers and the next
+  script runs. The switch **and the route pool** are durable, in the same
+  `llm_quota_retry` record with the same inheritance.
 - **Cancelling a turn keeps the entry.** The pending wait aborts, `pending`
   becomes `false`, and no `left` is announced; the entry and its `enteredAt`
   survive, and the next quota failure in that session re-arms the schedule.
   Only success or turning the switch off ends an entry.
-- **The composer chip shows the switch, not live progress.** Session
+- **The composer chips show the settings, not live progress.** Session
   projections recompute on session events, and the retry state changes between
   them, so a live "retrying now" badge would be up to an hour stale. Use the
   service, `/quota-routes`, or the three events for live progress.
@@ -439,8 +497,10 @@ export function apply(ctx) {
   429 code and would take its turn down here. The checks keep this plugin
   correct against both hosts.
 - **It consumes no model-visible context.** Nothing here reaches the model, and
-  the plugin appends no session events, so it adds no log vocabulary that another
-  build would have to know. A route it proposes is recorded the ordinary way, as
+  the one event the plugin appends is `model/selection` — the picker's own, so
+  the Client shows the route a pool chose. It introduces no new session
+  vocabulary a build would have to know, and it never touches the deployment's
+  default model. A route it proposes is recorded the ordinary way, as
   the config of the request that used it.
 
 ## Hot reload
@@ -451,12 +511,13 @@ replace the module generation in a running host: the plugin is disposed and
 re-imported, and `apply()` re-runs. A module missing from that list silently
 never reloads, so keep the list in step with the files.
 The in-memory retry state does not survive a reload — it drops a pending wait and
-its entry, and with them every reading, exhaustion mark, and pool assignment,
-exactly as a restart does; the next requests re-derive them. The durable
-per-session switch does survive, because it lives in the storage domain. Editing
+its entry, and with them every reading and exhaustion mark, exactly as a restart
+does; the next requests re-derive them. The durable per-session switch and route
+pool do survive, because they live in the storage domain. Editing
 `client.js` of an already-registered client row is picked up as a new artifact
 generation; only adding or changing the `dsh.client` manifest itself needs a
-restart, because the client-module scan caches that verdict per package.
+restart, because the client-module scan caches that verdict per package. The page
+is already open, so refresh it to load the new chip.
 
 ## Client bundle scope
 
@@ -468,8 +529,8 @@ contribution in it — not just this one.
 
 `client.js` therefore declares nothing at the top level: a single IIFE owns
 every name and only the `window.__ModuleLoader__.load(...)` call inside it
-reaches the shell. `probe/client-probe.mjs` enforces this by evaluating the
-bundle twice into one scope, which is exactly what a batch does.
+reaches the shell. It registers two composer chips — the retry switch and the
+route pool — into the same slot, each with its own registration and disposer.
 
 ## Probe
 
@@ -478,7 +539,9 @@ every decision, event, state transition, command outcome, inherited setting, and
 projection value without a Harness — including the route surface: the request
 that is moved off an exhausted provider, the immediate retry a pool with
 allowance produces, the long-term wait a pool without one still uses, the switch
-that stops both, and the balance scripts, seen through a fake subprocess service:
+that stops both, the pool setting (stated, inferred, opted out, inherited, and
+restored from storage), the `model/selection` event a chosen route is recorded
+as, and the balance scripts, seen through a fake subprocess service:
 
 ```sh
 node probe/probe.mjs
@@ -494,8 +557,8 @@ node probe/routes.probe.mjs
 ```
 
 `probe/client-probe.mjs` loads the composer half through a stub module loader
-and checks its slot registration, dictionary, menu contents, selected option,
-and the exact `/quota-retry` line it submits:
+and checks both chips: their slot registration, order, dictionary, menu contents,
+selected option, and the exact `/quota-retry` or `/quota-pool` line each submits:
 
 ```sh
 node probe/client-probe.mjs

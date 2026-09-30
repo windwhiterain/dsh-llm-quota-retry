@@ -1,12 +1,15 @@
 /**
- * Web composer half: a chip beside the model, permission, and compaction chips
- * showing whether this Session retries a quota-exhausted request once an hour,
- * with a menu that turns it on or off.
+ * Web composer half: two chips beside the model, permission, and compaction
+ * chips. The first shows whether this Session retries a quota-exhausted request
+ * once an hour, with a menu that turns it on or off; the second selects the
+ * route pool governing the Session, so the pool is chosen where the Session is
+ * read instead of in configuration.
  *
- * The current setting is read from the `quotaRetry` Session projection (the
- * host pushes it on every Session event, so a change made in another tab or by
- * a typed line lands here) and written by submitting `/quota-retry <argument>`,
- * so the composer and a typed line share exactly one write path.
+ * Both settings are read from the `quotaRetry` Session projection (the host
+ * pushes it on every Session event, so a change made in another tab or by a
+ * typed line lands here) and written by submitting `/quota-retry <argument>`
+ * and `/quota-pool <argument>`, so the composer and a typed line share exactly
+ * one write path per setting.
  *
  * Loaded as a dynamic client module; the factory id must equal the package name
  * so the bundle route and the module-table identity agree.
@@ -21,10 +24,10 @@
 /** Option id that turns long-term retry on for this Session. */
 const ON_OPTION = 'on'
 
-/** Option id that turns it off for this Session. */
+/** Option id that switches the setting off for this Session. */
 const OFF_OPTION = 'off'
 
-/** Option id that clears the Session's own value and follows the deployment default. */
+/** Option id that clears the Session's own value and returns to the default. */
 const DEFAULT_OPTION = 'default'
 
 /** Option id of the non-selectable failure row. */
@@ -46,8 +49,15 @@ const zh = {
   'state.off': '关',
   'note.inherited': '继承自父会话',
   'mode': '额度不足的处理方式：{state}',
+  'pool.chip.pool': '池 · {pool}',
+  'pool.chip.default': '池 · 默认',
+  'pool.chip.off': '池 · 关',
+  'pool.menu.heading': '这个会话的 route 池：某条 route 额度不足时换到池里还有余额的一条',
+  'pool.option.default': '默认（按当前模型自动判断在哪个池）',
+  'pool.option.off': '关闭（额度不足只等待，不换 provider）',
+  'pool.mode': 'route 池：{pool}',
   'error.command': '设置失败：{message}',
-  'error.unavailable': '宿主没有提供 /quota-retry 命令',
+  'error.unavailable': '宿主没有提供 /{command} 命令',
 }
 
 /** English copy. */
@@ -63,8 +73,15 @@ const en = {
   'state.off': 'off',
   'note.inherited': 'inherited from the parent session',
   'mode': 'Handling an exhausted quota: {state}',
+  'pool.chip.pool': 'Pool · {pool}',
+  'pool.chip.default': 'Pool · default',
+  'pool.chip.off': 'Pool · off',
+  'pool.menu.heading': 'The route pool for this session: when one route is out of allowance, move to a route of the pool that still has some',
+  'pool.option.default': 'Default (inferred from the model the session is on)',
+  'pool.option.off': 'Off (wait out an exhausted allowance without changing provider)',
+  'pool.mode': 'Route pool: {pool}',
   'error.command': 'The setting was not changed: {message}',
-  'error.unavailable': 'This host offers no /quota-retry command',
+  'error.unavailable': 'This host offers no /{command} command',
 }
 
 window.__ModuleLoader__.load({
@@ -73,12 +90,12 @@ window.__ModuleLoader__.load({
     const React = require('react')
     // `ui-primitives` is a baseline platform module: the shell seeds it into the
     // frozen module table, so a dynamic bundle requires it without declaring an
-    // external. Its Menu keeps this chip's popup identical to its siblings.
+    // external. Its Menu keeps these chips' popups identical to their siblings.
     const { IconChevronDownOutlineRegular, Menu } = require('@deepseek-ai/dsh-client-ui-primitives')
     const h = React.createElement
     const { useState } = React
 
-    /** The chip's inline chrome, matching the sibling composer chips. */
+    /** The chips' inline chrome, matching the sibling composer chips. */
     const triggerStyle = {
       display: 'inline-flex',
       alignItems: 'center',
@@ -127,6 +144,34 @@ window.__ModuleLoader__.load({
       return h('span', { style: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 } },
         h('span', { style: labelStyle }, label),
         h('span', { style: detailStyle }, detail))
+    }
+
+    /**
+     * The composer chip trigger both chips wear: its label, its chevron, and the
+     * hover and busy chrome the sibling composer chips use.
+     * @param props - open and busy state, the pointer and click handlers, the tooltip, and the label.
+     * @returns the anchor element a menu positions against.
+     */
+    function TriggerButton({ open, busy, hover, title, label, ariaLabel, onToggle, onEnter, onLeave }) {
+      return h('button', {
+        type: 'button',
+        style: {
+          ...triggerStyle,
+          ...hover && !busy ? { background: 'var(--dsw-alias-interactive-bg-hover)' } : {},
+          ...busy ? { color: 'var(--dsw-alias-label-dimmed)', cursor: 'default' } : {},
+        },
+        title,
+        'aria-label': ariaLabel,
+        'aria-haspopup': 'menu',
+        'aria-expanded': open,
+        disabled: busy,
+        onClick: onToggle,
+        onMouseEnter: onEnter,
+        onMouseLeave: onLeave,
+      },
+      h('span', { style: labelStyle }, label),
+      h('span', { style: { ...chevronStyle, ...open ? { transform: 'rotate(180deg)' } : {} }, 'aria-hidden': true },
+        h(IconChevronDownOutlineRegular)))
     }
 
     /**
@@ -186,26 +231,91 @@ window.__ModuleLoader__.load({
         onClose: () => { setOpen(false) },
         side: 'top',
         portal: true,
-        anchor: h('button', {
-          type: 'button',
-          style: {
-            ...triggerStyle,
-            ...hover && !busy ? { background: 'var(--dsw-alias-interactive-bg-hover)' } : {},
-            ...busy ? { color: 'var(--dsw-alias-label-dimmed)', cursor: 'default' } : {},
-          },
+        anchor: h(TriggerButton, {
+          open,
+          busy,
+          hover,
           title,
-          'aria-label': t('mode', { state: stateText }),
-          'aria-haspopup': 'menu',
-          'aria-expanded': open,
-          disabled: busy,
-          onClick: () => { setOpen(!open) },
-          onMouseEnter: () => { setHover(true) },
-          onMouseLeave: () => { setHover(false) },
-        },
-        h('span', { style: labelStyle }, label),
-        h('span', { style: { ...chevronStyle, ...open ? { transform: 'rotate(180deg)' } : {} }, 'aria-hidden': true },
-          h(IconChevronDownOutlineRegular)),
-        ),
+          label,
+          ariaLabel: t('mode', { state: stateText }),
+          onToggle: () => { setOpen(!open) },
+          onEnter: () => { setHover(true) },
+          onLeave: () => { setHover(false) },
+        }),
+      })
+    }
+
+    /**
+     * The composer chip selecting the route pool governing this Session: which
+     * route the plugin moves to when the route in use runs out of allowance.
+     * @param props - Session standard seats plus this slot's injected writer.
+     */
+    function QuotaPoolChip({ useProjection, setPool, t }) {
+      const facts = useProjection('quotaRetry')
+      const [open, setOpen] = useState(false)
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState(null)
+      const [hover, setHover] = useState(false)
+
+      // The absence rule is the retry chip's: a composition without the host row
+      // publishes no projection, so there is no pool to show or to select.
+      if (facts === undefined) return null
+
+      const poolNames = Array.isArray(facts.pools) ? facts.pools : []
+      const poolName = typeof facts.pool === 'string' && facts.pool !== '' ? facts.pool : null
+      const switchedOff = facts.poolSource === 'off'
+      const label = poolName === null
+        ? t(switchedOff ? 'pool.chip.off' : 'pool.chip.default')
+        : t('pool.chip.pool', { pool: poolName })
+      const currentId = switchedOff ? OFF_OPTION : poolName === null ? DEFAULT_OPTION : poolName
+      const inheritedNote = facts.poolSource === 'inherited' ? t('note.inherited') : null
+      // The bare word for the setting in force: the pool's own name, or the
+      // retry chip's words for an inferred default and for a session opted out.
+      const stateWord = poolName === null ? t(switchedOff ? 'state.off' : 'option.defaultUnknown') : poolName
+      const title = inheritedNote === null ? t('pool.menu.heading') : `${t('pool.menu.heading')} · ${inheritedNote}`
+
+      const items = [{ type: 'label', id: 'pool-heading', text: t('pool.menu.heading') }]
+      if (inheritedNote !== null) items.push({ type: 'label', id: 'pool-inherited', text: inheritedNote })
+      if (error !== null) items.push({ id: ERROR_OPTION, label: error, disabled: true, danger: true })
+      for (const name of poolNames) items.push({ id: name, label: h(Row, { label: name }) })
+      items.push({ id: DEFAULT_OPTION, label: h(Row, { label: t('pool.option.default') }) })
+      items.push({ id: OFF_OPTION, label: h(Row, { label: t('pool.option.off') }) })
+
+      const choose = (id) => {
+        if (id === ERROR_OPTION) return
+        setOpen(false)
+        if (id === currentId) return
+        setBusy(true)
+        setError(null)
+        Promise.resolve(setPool(id))
+          .catch((failure) => {
+            setError(t('error.command', {
+              message: failure instanceof Error ? failure.message : String(failure),
+            }))
+            setOpen(true)
+          })
+          .finally(() => { setBusy(false) })
+      }
+
+      return h(Menu, {
+        open,
+        items,
+        selectedId: currentId,
+        onSelect: choose,
+        onClose: () => { setOpen(false) },
+        side: 'top',
+        portal: true,
+        anchor: h(TriggerButton, {
+          open,
+          busy,
+          hover,
+          title,
+          label,
+          ariaLabel: t('pool.mode', { pool: stateWord }),
+          onToggle: () => { setOpen(!open) },
+          onEnter: () => { setHover(true) },
+          onLeave: () => { setHover(false) },
+        }),
       })
     }
 
@@ -215,12 +325,21 @@ window.__ModuleLoader__.load({
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'llm-quota-retry: dictionaries')
         const t = ctx.locale.bind(NS)
         const sessions = ctx.sessions
-        const submit = async (sessionId, argument) => {
+
+        /**
+         * Submit one `/<command> <argument>` line for a Session: the one write
+         * path a chip and a typed line share.
+         * @param sessionId - the Session the chip is rendered for.
+         * @param command - command name, without its leading slash.
+         * @param argument - the argument word the command parses.
+         * @returns true once the host ran the command.
+         */
+        const submit = async (sessionId, command, argument) => {
           const live = sessions.binding(sessionId)?.session
           if (live === undefined) throw new Error('this session is not materialized yet')
-          const result = await live.command(`/quota-retry ${argument}`)
+          const result = await live.command(`/${command} ${argument}`)
           if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`)
-          if (!result.value.matched) throw new Error(t('error.unavailable'))
+          if (!result.value.matched) throw new Error(t('error.unavailable', { command }))
           return true
         }
         ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
@@ -228,8 +347,15 @@ window.__ModuleLoader__.load({
           id: 'llm-quota-retry',
           order: 31,
           locale: NS,
-          inject: sessionId => ({ setEnabled: argument => submit(sessionId, argument) }),
+          inject: sessionId => ({ setEnabled: argument => submit(sessionId, 'quota-retry', argument) }),
         }, QuotaRetryChip))
+        ctx.slots.inject('conversation.input.left', () => ctx.slots.register({
+          name: 'conversation.input.left',
+          id: 'llm-quota-retry-pool',
+          order: 32,
+          locale: NS,
+          inject: sessionId => ({ setPool: argument => submit(sessionId, 'quota-pool', argument) }),
+        }, QuotaPoolChip))
       },
     }
   },

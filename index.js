@@ -29,13 +29,24 @@
  * fails over rather than waiting an hour. A Session with the switch off is not
  * moved. See the README's "Route pools and balance sources".
  *
+ * Which pool governs a Session is a setting of its own, in the same record and
+ * with the same inheritance: written through `/quota-pool` or the composer chip
+ * beside the switch, or by a delegation plugin that created the Session from a
+ * pooled template. A Session that states none follows the route it is on — a
+ * route exactly one pool holds names that pool — so an ordinary Session whose
+ * model is pooled fails over without being told to, and `off` opts out of route
+ * moves entirely. When one has to be chosen, the Session records it as
+ * `model/selection`, the event the model picker itself writes, so the Client
+ * shows the route in use; the deployment default for new Sessions is never
+ * changed by a failover.
+ *
  * Each Session's live retry state is readable through `ctx.llmQuotaRetry` —
  * along with `pickRoute` (choose a route for a Session that does not exist yet),
- * `assignPool`, and `report` — and the retry is announced through
- * `llm-quota-retry/entered`, `llm-quota-retry/failover`, and
- * `llm-quota-retry/left`. That state is in-memory and lives only as long as the
- * entry and the readings: unloading or restarting the host drops a pending wait
- * together with its entry.
+ * `setPool` (put a Session under a pool's care), `poolOf`, and `report` — and the
+ * retry is announced through `llm-quota-retry/entered`,
+ * `llm-quota-retry/failover`, and `llm-quota-retry/left`. That state is
+ * in-memory and lives only as long as the entry and the readings: unloading or
+ * restarting the host drops a pending wait together with its entry.
  *
  * This plugin imports no Harness package, so its bundle needs no dependencies
  * and the Session and Agent values it handles stay opaque.
@@ -50,7 +61,13 @@ import {
   isExhaustedAllowanceFailure,
   isSuccessfulResponse,
   normalizeSettingRecord,
+  ownedSettingOf,
+  parsePoolCommand,
   parseRetryCommand,
+  poolSettingOf,
+  poolSourceOf,
+  reservedPoolNames,
+  RESERVED_POOL_NAMES,
   resolveInheritedSetting,
   resolvePolicy,
   settingSource,
@@ -71,6 +88,9 @@ const PROJECTION_KEY = 'quotaRetry'
 
 /** Slash command both the composer chip and a typed line write through. */
 const COMMAND_NAME = 'quota-retry'
+
+/** Slash command choosing this Session's route pool. */
+const POOL_COMMAND_NAME = 'quota-pool'
 
 /** Slash command reporting the configured route pools and their readings. */
 const ROUTE_COMMAND_NAME = 'quota-routes'
@@ -96,6 +116,19 @@ const PASSTHROUGH_SCHEMA = { parse: value => value }
 export function apply(ctx, config = {}) {
   const policy = resolvePolicy(config, ROUTE_CONFIG_KEYS)
   const routes = resolveRoutes(config)
+  /** Every configured pool name, in configured order, as the chips list them. */
+  const poolNames = Object.freeze(Object.keys(routes.pools))
+  // A pool named after a word the command answers itself could never be selected,
+  // and the composer menu reserves one option id of its own, so this is a
+  // configuration error rather than a silently unreachable pool.
+  const reserved = reservedPoolNames(poolNames)
+  if (reserved.length > 0) {
+    throw new Error(
+      `llm-quota-retry: pool ${reserved.length === 1 ? 'name' : 'names'} `
+      + `${reserved.map(name => `"${name}"`).join(', ')} cannot be used; /quota-pool answers `
+      + `${RESERVED_POOL_NAMES.join(', ')} itself`,
+    )
+  }
   const routeState = new RouteState(routes)
   const ledger = new QuotaRetryLedger()
   const lifetime = new AbortController()
@@ -108,10 +141,14 @@ export function apply(ctx, config = {}) {
     logger: ctx.logger,
     lifetime,
   })
-  /** Session -> the pool a caller assigned it to, when one did. */
-  const assignedPools = new WeakMap()
-  /** Session -> the route its last resolved request used. */
-  const usedRoutes = new WeakMap()
+  /** Session id -> the route its last request used, for failover and the chip. */
+  const usedRoutes = new Map()
+  /**
+   * Sessions that were just put in a pool, so their next request moves into it
+   * even when the model they are on belongs to no pool. A pool change is a
+   * choice, and a choice applies at once.
+   */
+  const pendingChoices = new WeakSet()
   /** Session id -> the Session's own record, the fold and command write path. */
   const records = new Map()
   /** Session projection state -> its client value, for a stable wire reference. */
@@ -124,7 +161,8 @@ export function apply(ctx, config = {}) {
     isRetrying: session => ledger.isRetrying(session),
     stateOf: session => ledger.stateOf(session),
     pickRoute: poolName => pickRoute(poolName),
-    assignPool: (session, poolName) => assignPool(session, poolName),
+    setPool: (session, poolName) => setPool(session, poolName),
+    poolOf: session => effectivePoolName(session.id),
     report: () => routeState.report(Date.now()),
   }))
 
@@ -154,38 +192,84 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * Put a Session under one pool's care, so a route the pools share is not left
-   * to inference.
-   * @param session - the Session to assign.
-   * @param poolName - the pool that governs it.
-   * @returns whether the pool exists; an unknown name assigns nothing.
+   * Put a Session under one pool's care, or take it out of every pool.
+   *
+   * This is the one write path for the pool setting: the `/quota-pool` command
+   * and the composer chip go through it, and so does a delegation plugin that
+   * creates a child from a pooled template. The choice applies to the Session's
+   * next request, where a live Agent exists to record it — see the request hook.
+   *
+   * @param session - the Session to put in the pool.
+   * @param poolName - the pool that governs it, or `null` to opt out of route
+   *   moves entirely.
+   * @returns whether the pool exists; an unknown name changes nothing.
    */
-  function assignPool(session, poolName) {
-    if (routes.pools[poolName] === undefined) return false
-    assignedPools.set(session, poolName)
+  function setPool(session, poolName) {
+    if (poolName !== null && routes.pools[poolName] === undefined) return false
+    applyInheritance(session.id, session.header?.parentSession ?? null)
+    const record = records.get(session.id) ?? { enabled: null }
+    writeRecord(session.id, { ...record, pool: poolName })
+    pendingChoices.add(session)
     return true
+  }
+
+  /**
+   * The pool that governs one Session right now, named the way the chip shows it:
+   * the one the Session states, or the one its route belongs to when nobody
+   * stated one.
+   * @param sessionId - the Session to name.
+   * @returns the pool name, or undefined when no pool governs this Session.
+   */
+  function effectivePoolName(sessionId) {
+    const setting = poolSettingOf(records.get(sessionId))
+    if (setting.explicit) return setting.name ?? undefined
+    const route = usedRoutes.get(sessionId)
+    return route === undefined ? undefined : routeState.poolOfRoute(route.provider, route.model)?.name
   }
 
   /**
    * The pool that governs one Session's use of one route.
    *
-   * An assigned pool wins while the Session is still on one of its routes; a
-   * route the Session moved to by itself (the user's model picker) belongs to no
-   * pool as far as this Session is concerned, so its choice is left alone.
-   * Without an assignment, a route exactly one pool holds names that pool.
+   * A stated pool wins while the Session is still on one of its routes; a route
+   * the Session moved to by itself (the user's model picker) belongs to no pool
+   * as far as this Session is concerned, so its choice is left alone. Without a
+   * stated pool, a route exactly one pool holds names that pool.
    *
    * @param session - the Session making the request.
    * @param route - the route the request would use.
    * @returns the pool name, or undefined when this Session is not pooled.
    */
   function poolFor(session, route) {
-    const assigned = assignedPools.get(session)
-    if (assigned !== undefined) {
-      const pool = routes.pools[assigned]
+    const setting = poolSettingOf(records.get(session.id))
+    if (setting.explicit) {
+      if (setting.name === null) return undefined
+      const pool = routes.pools[setting.name]
       const member = pool?.routes.some(entry => entry.provider === route.provider && entry.model === route.model)
-      return member === true ? assigned : undefined
+      return member === true ? setting.name : undefined
     }
     return routeState.poolOfRoute(route.provider, route.model)?.name
+  }
+
+  /**
+   * Record the route a Session is about to use, on the Session itself when it can
+   * be recorded there.
+   *
+   * The event is `model/selection` — the one the model picker appends — so the
+   * Client's picker shows the route a pool chose instead of the model the Session
+   * was created with. The deployment default is deliberately untouched: a quota
+   * failover must not change the model new Sessions start from.
+   *
+   * @param session - the Session whose route this is.
+   * @param route - the route it will use.
+   */
+  function applyRoute(session, route) {
+    usedRoutes.set(session.id, { provider: route.provider, model: route.model })
+    if (typeof session.append !== 'function') return
+    session.append('model/selection', {
+      provider: route.provider,
+      model: route.model,
+      ...route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort },
+    })
   }
 
   function track(operation) {
@@ -212,10 +296,10 @@ export function apply(ctx, config = {}) {
     const found = resolveInheritedSetting(
       parentId,
       id => sessionsService()?.get(id)?.header?.parentSession ?? null,
-      id => records.get(id)?.enabled ?? null,
+      id => ownedSettingOf(records.get(id)),
     )
     if (found === null) return
-    writeRecord(sessionId, { enabled: found.value, inheritedFrom: found.fromId })
+    writeRecord(sessionId, { ...found.owned, inheritedFrom: found.fromId })
   }
 
   /**
@@ -284,37 +368,53 @@ export function apply(ctx, config = {}) {
   })
 
   // A request is proposed as this Session's route, and this is where a pooled
-  // Session is moved off one that is out of allowance. The decision reads cached
-  // readings and marks only: it starts no script and waits for nothing, because
-  // a model request must never be held behind a balance probe. A reading below
-  // the route's own threshold does not move an open Session — that threshold
-  // decides which route a Session starts on, not whether it is interrupted.
+  // Session is moved into its pool's choice or off a route that is out of
+  // allowance. The decision reads cached readings and marks only: it starts no
+  // script and waits for nothing, because a model request must never be held
+  // behind a balance probe. A reading below the route's own threshold does not
+  // move an open Session — that threshold decides which route a Session starts
+  // on, not whether it is interrupted.
   const disposeRequest = ctx.on('agent/request', async ({ agent }, next) => {
     const resolved = await next()
     const session = agent.session
     const route = { provider: resolved.provider, model: resolved.model }
+    const choosing = pendingChoices.delete(session)
     if (!enabledForSession(session)) {
-      usedRoutes.set(session, route)
+      usedRoutes.set(session.id, route)
       return resolved
     }
-    const poolName = poolFor(session, route)
-    const replacement = poolName === undefined
-      ? undefined
-      : routeState.replacementFor(poolName, route, Date.now())
-    if (replacement === undefined) {
-      usedRoutes.set(session, route)
+    // A Session just put in a pool is moved into it even when the model it is on
+    // belongs to no pool: choosing a pool is choosing to leave that model behind.
+    const stated = poolSettingOf(records.get(session.id))
+    const poolName = choosing && stated.explicit && stated.name !== null
+      ? stated.name
+      : poolFor(session, route)
+    if (poolName === undefined) {
+      usedRoutes.set(session.id, route)
       return resolved
     }
-    ctx.logger.info(
-      `llm-quota-retry: session ${session.id} moves from ${route.provider}/${route.model} `
-      + `to ${replacement.provider}/${replacement.model} (pool "${poolName}")`,
-    )
-    usedRoutes.set(session, { provider: replacement.provider, model: replacement.model })
+    const now = Date.now()
+    const chosen = choosing
+      ? routeState.pick(poolName, now)
+      : routeState.replacementFor(poolName, route, now)
+    if (chosen === undefined) {
+      usedRoutes.set(session.id, route)
+      return resolved
+    }
+    const moved = chosen.provider !== route.provider || chosen.model !== route.model
+    if (moved) {
+      ctx.logger.info(
+        `llm-quota-retry: session ${session.id} moves from ${route.provider}/${route.model} `
+        + `to ${chosen.provider}/${chosen.model} (pool "${poolName}")`,
+      )
+    }
+    applyRoute(session, chosen)
+    if (!moved) return resolved
     return {
       ...resolved,
-      provider: replacement.provider,
-      model: replacement.model,
-      ...replacement.reasoningEffort === undefined ? {} : { reasoningEffort: replacement.reasoningEffort },
+      provider: chosen.provider,
+      model: chosen.model,
+      ...chosen.reasoningEffort === undefined ? {} : { reasoningEffort: chosen.reasoningEffort },
     }
   })
 
@@ -327,7 +427,7 @@ export function apply(ctx, config = {}) {
    *   is not pooled or no route of its pool can answer.
    */
   function failoverFor(session, now) {
-    const used = usedRoutes.get(session)
+    const used = usedRoutes.get(session.id)
     if (used === undefined) return undefined
     const poolName = poolFor(session, used)
     if (poolName === undefined) return undefined
@@ -348,7 +448,7 @@ export function apply(ctx, config = {}) {
 
     const failover = failoverFor(session, now)
     if (failover !== undefined) {
-      const used = usedRoutes.get(session)
+      const used = usedRoutes.get(session.id)
       ctx.emit('llm-quota-retry/failover', {
         session,
         agent,
@@ -362,6 +462,9 @@ export function apply(ctx, config = {}) {
         `llm-quota-retry: provider "${provider}" returned ${failure.code}; `
         + `retrying on ${failover.route.provider}/${failover.route.model} (pool "${failover.pool}")`,
       )
+      // The Session itself records the move, so the model picker shows the route
+      // the retry actually uses rather than the one that just refused it.
+      applyRoute(session, failover.route)
       return { kind: 'retry' }
     }
 
@@ -461,6 +564,12 @@ export function apply(ctx, config = {}) {
       handler: ({ agent, rawInput }) => runCommand(agent, rawInput ?? ''),
     }))
     child.effect(() => child.commands.register({
+      name: POOL_COMMAND_NAME,
+      description: 'Choose the route pool this session falls back to when a provider is out of allowance',
+      input: { hint: '<pool|off|default|status>' },
+      handler: ({ agent, rawInput }) => runPoolCommand(agent, rawInput ?? ''),
+    }))
+    child.effect(() => child.commands.register({
       name: ROUTE_COMMAND_NAME,
       description: 'Report the configured route pools and what each route\'s balance script last reported',
       input: { hint: '[pool]' },
@@ -499,9 +608,13 @@ export function apply(ctx, config = {}) {
   }
 
   /**
-   * Fold one Session's switch and its origin into the projection state,
-   * returning the previous object when nothing observable changed (the
-   * registry's change gate compares references).
+   * Fold one Session's switch, pool, and their origins into the projection state,
+   * returning the previous object when nothing observable changed (the registry's
+   * change gate compares references).
+   *
+   * The pool reported is the *effective* one: the name the Session states, or the
+   * one the route it is on belongs to. `undefined` when no pool governs it.
+   *
    * @param sessionId - the Session being projected.
    * @param previous - the state this Session was last folded into.
    * @returns the next state.
@@ -510,21 +623,37 @@ export function apply(ctx, config = {}) {
     const record = records.get(sessionId)
     const enabled = effectiveEnabled(record, policy.defaultEnabled)
     const source = settingSource(record, policy.defaultEnabled)
-    if (previous !== undefined && previous.enabled === enabled && previous.source === source) return previous
-    return { sessionId, enabled, source }
+    const poolSource = poolSourceOf(record)
+    const setting = poolSettingOf(record)
+    const pool = setting.explicit
+      ? setting.name
+      : effectivePoolName(sessionId)
+    if (previous !== undefined
+      && previous.enabled === enabled
+      && previous.source === source
+      && previous.pool === pool
+      && previous.poolSource === poolSource) return previous
+    return { sessionId, enabled, source, pool, poolSource }
   }
 
   /**
    * Identity-stable client value for one projection state, so an unchanged
    * setting suppresses publication.
    * @param state - the Session's current projection state.
-   * @returns the wire value the composer chip reads.
+   * @returns the wire value the composer chips read.
    */
   function viewOf(state) {
     const cached = views.get(state.sessionId)
-    if (cached !== undefined && cached.state === state) return cached.value
-    const value = { enabled: state.enabled, defaultEnabled: policy.defaultEnabled, source: state.source }
-    views.set(state.sessionId, { state, value })
+    if (cached !== undefined && cached.state === state && cached.pools === poolNames) return cached.value
+    const value = {
+      enabled: state.enabled,
+      defaultEnabled: policy.defaultEnabled,
+      source: state.source,
+      pool: state.pool ?? null,
+      poolSource: state.poolSource,
+      pools: poolNames,
+    }
+    views.set(state.sessionId, { state, pools: poolNames, value })
     return value
   }
 
@@ -562,6 +691,79 @@ export function apply(ctx, config = {}) {
       default:
         return { kind: 'error', text: 'quota-retry: unsupported request' }
     }
+  }
+
+  /**
+   * Apply one `/quota-pool` invocation.
+   * @param agent - the Agent the command runs for.
+   * @param rawInput - the text after the command name.
+   * @returns the command outcome.
+   */
+  async function runPoolCommand(agent, rawInput) {
+    const session = agent.session
+    const parsed = parsePoolCommand(rawInput, poolNames)
+    switch (parsed.kind) {
+      case 'report':
+        return { kind: 'success', text: reportPool(session) }
+      case 'set': {
+        setPool(session, parsed.pool)
+        // The status line names what the pool answers now, so a person choosing
+        // one sees which route the next request takes. This is a user action, so
+        // it may wait for the pool's own providers to be read.
+        const chosen = await pickRoute(parsed.pool)
+        return {
+          kind: 'success',
+          text: `route pool "${parsed.pool}" governs this session; its next request uses `
+            + `${chosen.provider}/${chosen.model}`,
+        }
+      }
+      case 'off':
+        setPool(session, null)
+        return {
+          kind: 'success',
+          text: 'route moves are off for this session: an exhausted allowance is waited out '
+            + 'without changing provider',
+        }
+      case 'default': {
+        applyInheritance(session.id, session.header?.parentSession ?? null)
+        const record = records.get(session.id) ?? { enabled: null }
+        const { pool: _dropped, ...rest } = record
+        writeRecord(session.id, rest)
+        return {
+          kind: 'success',
+          text: `this session states no pool again; ${reportPool(session)}`,
+        }
+      }
+      case 'invalid':
+        return { kind: 'error', text: parsed.reason }
+      default:
+        return { kind: 'error', text: 'quota-pool: unsupported request' }
+    }
+  }
+
+  /**
+   * The human-readable route pool for one Session.
+   * @param session - the Session to report.
+   * @returns one line naming the effective pool, where the setting came from, and
+   *   the route the Session is on.
+   */
+  function reportPool(session) {
+    const record = records.get(session.id)
+    const source = poolSourceOf(record)
+    const pool = effectivePoolName(session.id)
+    const route = usedRoutes.get(session.id)
+    const origin = source === 'off'
+      ? 'route moves are off for this session'
+      : source === 'inherited'
+        ? `inherited from ${record.inheritedFrom}`
+        : source === 'session'
+          ? 'stated by this session'
+          : pool === undefined
+            ? 'no pool governs this session'
+            : 'inferred from the route this session is on'
+    return `route pool ${pool === undefined ? '(none)' : `"${pool}"`} — ${origin}`
+      + `; configured pools: ${poolNames.length === 0 ? '(none)' : poolNames.join(', ')}`
+      + `; this session is on ${route === undefined ? 'no request yet' : `${route.provider}/${route.model}`}`
   }
 
   /**
