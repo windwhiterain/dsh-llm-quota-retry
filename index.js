@@ -102,6 +102,7 @@ export function apply(ctx, config = {}) {
   const active = new Set()
   const balances = createBalanceRegistry({
     getSubprocess: () => ctx.get('subprocess'),
+    getCredentials: () => ctx.get('credentials'),
     routes,
     state: routeState,
     logger: ctx.logger,

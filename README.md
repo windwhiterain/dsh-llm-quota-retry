@@ -124,7 +124,7 @@ later — and reports `left` with reason `disabled`.
 | `longTermDelayMs` | `3600000` | Interval between long-term attempts, in milliseconds. Must be a positive finite number no greater than `2147483647`. |
 | `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes the whole allowance response opt-in. |
 | `pools` | none | Named, ordered route lists a session may be moved between. See below. |
-| `balances` | none | One balance script per provider, reporting what it has left. See below. |
+| `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with. See below. |
 | `failOpen` | `true` | Whether a route nothing reported on counts as usable. `false` makes an unread provider unusable, so only a route a script vouches for is ever chosen. |
 | `exhaustedCooldownMs` | `3600000` | How long a provider stays marked after a request failed with an exhausted allowance. Must be a positive finite number no greater than `2147483647`. |
 
@@ -160,12 +160,11 @@ reports what one provider has left.
     balances:
       - provider: opencode-go
         script: ['node', 'C:/resource/dsh-balance/opencode-go.mjs']
+        apiKeyEnv: OPENCODE_API_KEY   # resolved through the credential service, then forwarded
         unit: percent             # what `remaining` counts, for a person reading it
         minimumRemaining: 5       # below this the route is not usable
         refreshMs: 60000
         timeoutMs: 5000
-        env:                      # the script's own credentials, forwarded explicitly
-          OPENCODE_API_KEY: !!js process.env.OPENCODE_API_KEY
       - provider: qwen
         script: ['node', 'C:/resource/dsh-balance/qwen.mjs']
         minimumRemaining: 0
@@ -193,9 +192,18 @@ timeout (`timeoutMs`), output that is not that JSON object, or no subprocess
 service in the composition. A missing reading never stops a request — it is the
 exhaustion mark, not a probe, that keeps a spent provider out of the way.
 
-The script owns its credentials. Only the environment entries the row names in
-`env` are forwarded to it; `!!js process.env.X` in the profile patch is the way
-to pass one through. The plugin never writes a script's stdout to a log.
+The script owns its requests, and this plugin forwards it only what the row names.
+`apiKeyEnv` is the credential it should use: the plugin resolves that reference
+through the harness's **credential service** at every run — so a key stored as an
+environment variable, in a `.env`, or in the credential store all work the same
+way, and a rotated key reaches the next run — and passes it to the script under
+the same name (`OPENCODE_API_KEY=…`). A reference nothing is configured for adds
+no entry and logs a warning; the script still runs, so it may read a key from
+somewhere this plugin does not know about, and its own message is the better
+diagnostic. `env` adds any other literal entries the script needs (a base URL, a
+region, a proxy) and is never used for secrets.
+
+The plugin never writes a script's stdout into a log.
 
 ### How a route is chosen
 

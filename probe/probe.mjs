@@ -114,7 +114,7 @@ function createSessionRegistry(parents) {
  * finds its dependency, which is how the probe covers the durable and
  * process-local paths with the same plugin code.
  */
-function createContext({ store = new Map(), parents = new Map(), withStorage = false, subprocess = null } = {}) {
+function createContext({ store = new Map(), parents = new Map(), withStorage = false, subprocess = null, credentials = null } = {}) {
   const hooks = new Map()
   const emitted = []
   const cleanups = []
@@ -127,6 +127,7 @@ function createContext({ store = new Map(), parents = new Map(), withStorage = f
   ])
   if (withStorage) services.set('storageDomain', createStorageDomain(store))
   if (subprocess !== null) services.set('subprocess', subprocess)
+  if (credentials !== null) services.set('credentials', credentials)
 
   function effect(callback) {
     // Cordis runs the callback at registration and keeps its returned disposer.
@@ -717,6 +718,45 @@ check('the published service keeps its retry surface and adds the route surface'
   assert.deepEqual(context.service.report(), [])
   assert.equal(await context.service.pickRoute('nothing'), undefined)
   assert.equal(context.service.assignPool(session, 'nothing'), false)
+})
+
+check('a balance script receives the credential its apiKeyEnv names', async () => {
+  const scripts = createSubprocess(['{"remaining": 3}'])
+  const resolved = []
+  const context = createContext({
+    subprocess: scripts,
+    credentials: {
+      resolve: async (ref) => {
+        resolved.push(ref)
+        return ref === 'PROBE_KEY' ? { value: 'resolved-secret', source: 'file' } : undefined
+      },
+    },
+  })
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } },
+    balances: [{ provider: 'first', script: ['probe-script'], apiKeyEnv: 'PROBE_KEY', minimumRemaining: 1 }],
+  })
+  assert.deepEqual(await context.service.pickRoute('medium'), { provider: 'first', model: 'one' })
+  assert.deepEqual(resolved, ['PROBE_KEY'], 'the reference is resolved per run, not cached')
+  assert.deepEqual(scripts.spawned[0].env, { PROBE_KEY: 'resolved-secret' })
+})
+
+check('an unconfigured credential leaves the script to report it', async () => {
+  const scripts = createSubprocess(['{"remaining": 3}'])
+  const context = createContext({
+    subprocess: scripts,
+    credentials: { resolve: async () => undefined },
+  })
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } },
+    balances: [
+      { provider: 'first', script: ['probe-script'], apiKeyEnv: 'MISSING_KEY', minimumRemaining: 1, env: { HINT: 'x' } },
+    ],
+  })
+  assert.deepEqual(await context.service.pickRoute('medium'), { provider: 'first', model: 'one' })
+  assert.deepEqual(scripts.spawned[0].env, { HINT: 'x' }, 'a missing credential adds no entry, and the row env still arrives')
 })
 
 for (const { name, run } of checks) {

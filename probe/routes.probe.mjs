@@ -64,6 +64,14 @@ check('config: a malformed pool, route, or balance source fails the row', () => 
   assert.throws(() => resolveRoutes({ balances: {} }), /balances must be an array/)
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: [] }] }), /script must be a non-empty array/)
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], env: { A: 1 } }] }), /env.A must be a string/)
+  assert.equal(
+    resolveRoutes({ balances: [{ provider: 'p', script: ['s'], apiKeyEnv: 'P_API_KEY' }] }).balances[0].apiKeyEnv,
+    'P_API_KEY',
+  )
+  assert.throws(
+    () => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], apiKeyEnv: ' ' }] }),
+    /apiKeyEnv must be a non-empty credential reference/,
+  )
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], timeoutMs: 0 }] }), /timeoutMs must be greater than 0/)
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], minimumRemaining: 'x' }] }), /minimumRemaining must be a finite number/)
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'] }, { provider: 'p', script: ['s'] }] }), /duplicate balance source/)
