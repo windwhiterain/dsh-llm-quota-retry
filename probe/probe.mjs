@@ -759,6 +759,28 @@ check('an unconfigured credential leaves the script to report it', async () => {
   assert.deepEqual(scripts.spawned[0].env, { HINT: 'x' }, 'a missing credential adds no entry, and the row env still arrives')
 })
 
+check('choosing a route probes only that pool\'s providers', async () => {
+  const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 0}', '{"remaining": 0}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: {
+      first: { routes: [{ provider: 'inside', model: 'i' }] },
+      second: { routes: [{ provider: 'outside', model: 'o' }] },
+    },
+    balances: [
+      { provider: 'inside', script: ['probe-script'], minimumRemaining: 1 },
+      { provider: 'outside', script: ['probe-script'], minimumRemaining: 1 },
+    ],
+  })
+  assert.deepEqual(await context.service.pickRoute('second'), { provider: 'outside', model: 'o' })
+  const probed = scripts.spawned.map(spec => spec.argv[0])
+  assert.deepEqual(probed, ['probe-script'], 'only the asked pool\'s provider ran its script')
+  // The first pool's own provider is still unread, so asking for it probes now.
+  await context.service.pickRoute('first')
+  assert.equal(scripts.spawned.length, 2)
+})
+
 for (const { name, run } of checks) {
   await run()
   console.log(`ok  ${name}`)

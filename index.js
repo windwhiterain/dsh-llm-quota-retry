@@ -141,8 +141,11 @@ export function apply(ctx, config = {}) {
    * @returns the chosen route, or undefined when no pool by that name exists.
    */
   async function pickRoute(poolName) {
-    if (routes.pools[poolName] === undefined) return undefined
-    await balances.refreshStale({ wait: true })
+    const pool = routes.pools[poolName]
+    if (pool === undefined) return undefined
+    // Only the pool's own providers are probed: a route a pool cannot use is not
+    // worth a round trip before a delegation.
+    await balances.refreshStale({ wait: true, providers: pool.routes.map(route => route.provider) })
     const chosen = routeState.pick(poolName, Date.now())
     ctx.logger.info(
       `llm-quota-retry: pool "${poolName}" answers ${chosen.provider}/${chosen.model}`,

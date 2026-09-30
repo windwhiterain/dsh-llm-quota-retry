@@ -242,7 +242,9 @@ never declared is an error, and the caller that named it reports it as one.
   pool at creation, which is what makes a pool name mean the same thing to the
   delegating session and to its child.
 - **A new session** can ask for a route before it exists, through `pickRoute`,
-  which refreshes stale readings first (so it may wait up to `timeoutMs`). This
+  which refreshes the stale readings of **that pool's own providers** first, so a
+  pool never probes a provider it cannot use and the wait is bounded by the
+  slowest script in that pool. This
   is the delegation-time half: `dsh-subagent-templates` templates name a pool and
   call it for every child they create.
 
@@ -280,8 +282,9 @@ in-memory: it exists only while a wait is live.
 
 ```js
 // Choose the route a session that does not exist yet should start on. Refreshes
-// stale readings first, so it may wait up to the slowest script's `timeoutMs`.
-// `undefined` means no pool by that name exists — a config error at the caller.
+// that pool's stale readings first, so it may wait up to the slowest of THEIR
+// scripts' `timeoutMs`. `undefined` means no pool by that name exists — a config
+// error at the caller.
 const route = await ctx.llmQuotaRetry.pickRoute('medium')
 // route.provider, route.model, route.reasoningEffort?
 
