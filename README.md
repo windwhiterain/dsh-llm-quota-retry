@@ -187,7 +187,9 @@ whole deployment; the row below also shortens the interval.
 
 A **route** is one provider/model pair. A **pool** is a named, ordered list of
 routes that can stand in for each other. A **balance source** is a script that
-reports what one provider has left.
+reports what one provider has left. The scripts this deployment runs live in
+[dsh-balance](https://github.com/windwhiterain/dsh-balance) — one file per
+provider, no dependencies, each printing one JSON reading on stdout.
 
 ```yaml
 - id: llm-quota-retry
@@ -197,7 +199,7 @@ reports what one provider has left.
       medium:
         routes:
           - { provider: opencode-go, model: deepseek-v4.1-flash, reasoningEffort: high }
-          - { provider: qwen, model: qwen3.8-max, reasoningEffort: high }
+          - { provider: command-code-goat, model: deepseek/deepseek-v4.1-flash, reasoningEffort: high }
     balances:
       - provider: opencode-go
         script: ['node', 'C:/resource/dsh-balance/opencode-go.mjs']
@@ -206,9 +208,11 @@ reports what one provider has left.
         minimumRemaining: 5       # below this a route is not chosen, and never one already running
         refreshMs: 60000
         timeoutMs: 5000
-      - provider: qwen
-        script: ['node', 'C:/resource/dsh-balance/qwen.mjs']
-        minimumRemaining: 0
+      - provider: command-code-goat
+        script: ['node', 'C:/resource/dsh-balance/command-code-goat.mjs']
+        apiKeyEnv: COMMAND_CODE_GOAT_API_KEY
+        unit: usd-left
+        minimumRemaining: 1
 ```
 
 ### The balance script contract
