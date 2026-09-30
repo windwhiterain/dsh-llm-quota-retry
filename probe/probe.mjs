@@ -597,6 +597,26 @@ check('a pooled session moves to a route with allowance and retries at once', as
     'the next request of that session is proposed on the replacement route')
 })
 
+check('a reading below the threshold leaves an open session where it is', async () => {
+  const scripts = createSubprocess(['{"remaining": 0}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
+    balances: [{ provider: 'first', script: ['probe-script'], minimumRemaining: 1 }],
+  })
+  assert.deepEqual(
+    await context.service.pickRoute('medium'),
+    { provider: 'second', model: 'two' },
+    'a session that has not started avoids the route below its threshold',
+  )
+  assert.deepEqual(
+    await dispatchRequest(context, agent, { provider: 'first', model: 'one' }),
+    { provider: 'first', model: 'one' },
+    'the session already on it is not interrupted for a threshold',
+  )
+})
+
 check('a pool with nothing usable falls back to the long-term wait', async () => {
   const context = createContext()
   apply(context, {

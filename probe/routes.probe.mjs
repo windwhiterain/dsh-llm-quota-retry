@@ -172,7 +172,25 @@ check('a route exactly one pool holds names that pool, a shared one names none',
   assert.equal(state.poolOfRoute('nowhere', 'nothing'), undefined)
 })
 
-check('replacement keeps a usable route and replaces an unusable one in declared order', () => {
+check('a below-threshold reading does not move a session that has already started', () => {
+  const state = new RouteState(POLICY)
+  const now = 5_000
+  state.noteReading('second', { remaining: 1 }, now)
+  assert.equal(state.isUsable('second', now), false, 'a new session would not start here')
+  assert.equal(
+    state.replacementFor('medium', { provider: 'second', model: 'two' }, now),
+    undefined,
+    'a live conversation is not interrupted for a threshold',
+  )
+  state.noteExhausted('second', now)
+  assert.deepEqual(
+    state.replacementFor('medium', { provider: 'second', model: 'two' }, now),
+    { provider: 'first', model: 'one', reasoningEffort: 'high' },
+    'the provider reporting the allowance spent does move it',
+  )
+})
+
+check('replacement keeps a live route and leaves an exhausted one in declared order', () => {
   const state = new RouteState(POLICY)
   const now = 5_000
   assert.equal(state.replacementFor('medium', { provider: 'third', model: 'three' }, now), undefined)
@@ -184,8 +202,18 @@ check('replacement keeps a usable route and replaces an unusable one in declared
   })
   state.noteExhausted('first', now)
   state.noteReading('second', { remaining: 0 }, now)
-  assert.deepEqual(state.replacementFor('medium', { provider: 'third', model: 'three' }, now), undefined,
-    'nothing usable is left, so the session keeps the route it proposed')
+  assert.deepEqual(
+    state.replacementFor('medium', { provider: 'third', model: 'three' }, now),
+    { provider: 'second', model: 'two' },
+    'a route below its threshold is still better than one the provider already refused',
+  )
+})
+
+check('an exhausted pool with no candidate leaves the session where it is', () => {
+  const state = new RouteState(POLICY)
+  const now = 5_000
+  for (const provider of ['first', 'second', 'third']) state.noteExhausted(provider, now)
+  assert.equal(state.replacementFor('medium', { provider: 'third', model: 'three' }, now), undefined)
 })
 
 check('the report carries each route\'s reading and mark', () => {

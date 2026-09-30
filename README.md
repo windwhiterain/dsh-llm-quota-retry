@@ -162,7 +162,7 @@ reports what one provider has left.
         script: ['node', 'C:/resource/dsh-balance/opencode-go.mjs']
         apiKeyEnv: OPENCODE_API_KEY   # resolved through the credential service, then forwarded
         unit: percent             # what `remaining` counts, for a person reading it
-        minimumRemaining: 5       # below this the route is not usable
+        minimumRemaining: 5       # below this a route is not chosen, and never one already running
         refreshMs: 60000
         timeoutMs: 5000
       - provider: qwen
@@ -207,6 +207,15 @@ The plugin never writes a script's stdout into a log.
 
 ### How a route is chosen
 
+**A choice and an interruption are two different rules.** A threshold
+(`minimumRemaining`) decides which route a session *starts* on, and which route a
+session moves to; it never interrupts a session that is already running on one.
+That split is deliberate: another account can mean another model, another prompt
+cache, and another price, so a live conversation is only moved when the route it
+is on cannot answer at all.
+
+**Choosing a route**, in this order:
+
 1. **An exhaustion mark decides first.** A provider that answered a request with
    an exhausted allowance is unusable until its mark lapses
    (`exhaustedCooldownMs`), or until a reading *taken after* the mark — at least
@@ -223,6 +232,13 @@ answers with its first route: a request has to run somewhere, and the long-term
 wait covers the case where every route refuses it. Only a pool the configuration
 never declared is an error, and the caller that named it reports it as one.
 
+**Leaving a route** needs one thing: the provider itself reporting the allowance
+spent. A reading below the threshold does not move a session that has already
+started, and neither does a pool reordering. The move is then made the way a
+choice is — the first route in declared order that is not out of allowance and
+clears its own threshold, or failing that any route that is merely not out of
+allowance — because a route with little left can still be the one that answers.
+
 ### What happens to a session
 
 - **At the end of a step**, before any waiting: a request that failed with an
@@ -231,9 +247,11 @@ never declared is an error, and the caller that named it reports it as one.
   `llm-quota-retry/failover`; none found means the long-term wait, exactly as
   before.
 - **At every request**, the route the session would otherwise use is replaced
-  when it is not usable and a pool route is. This decision reads cached readings
-  and marks only — it starts no script and waits for nothing, because a model
-  request must never be held behind a balance probe. A route the user picked in
+  when its provider has **reported the allowance spent**, and the pool holds a
+  route that has not. This decision reads cached readings and marks only — it
+  starts no script and waits for nothing, because a model request must never be
+  held behind a balance probe. A reading below a route's threshold does not move
+  an open session (see "How a route is chosen"), and a route the user picked in
   the model picker is left alone as soon as it falls outside the session's pool.
 - **Which pool governs a session**: the one a caller assigned it to
   (`assignPool`), or — when nobody did — the single pool that holds the route the

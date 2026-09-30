@@ -284,9 +284,11 @@ export function apply(ctx, config = {}) {
   })
 
   // A request is proposed as this Session's route, and this is where a pooled
-  // Session is moved off one that cannot answer. The decision reads cached
+  // Session is moved off one that is out of allowance. The decision reads cached
   // readings and marks only: it starts no script and waits for nothing, because
-  // a model request must never be held behind a balance probe.
+  // a model request must never be held behind a balance probe. A reading below
+  // the route's own threshold does not move an open Session — that threshold
+  // decides which route a Session starts on, not whether it is interrupted.
   const disposeRequest = ctx.on('agent/request', async ({ agent }, next) => {
     const resolved = await next()
     const session = agent.session
