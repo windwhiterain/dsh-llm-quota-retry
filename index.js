@@ -74,6 +74,7 @@ import {
 } from './lib/policy.js'
 import { ROUTE_CONFIG_KEYS, RouteState, resolveRoutes } from './lib/routes.js'
 import { createBalanceRegistry } from './lib/balance.js'
+import { collectProviders, createProviderCheck } from './lib/providers.js'
 
 export const name = 'llm-quota-retry'
 
@@ -141,6 +142,18 @@ export function apply(ctx, config = {}) {
     logger: ctx.logger,
     lifetime,
   })
+  // A route's provider reaches a model request as this plugin's own
+  // `model/selection`, so a name no adapter serves is a configuration defect worth
+  // naming rather than a `NO_ADAPTER` worth debugging at the request. Composition
+  // order decides when each adapter appears and nothing announces that the
+  // composition has finished, so this follows the announcements and the first
+  // routing decision instead of deciding once here.
+  const providerCheck = createProviderCheck({
+    ...collectProviders(routes),
+    resolveLlm: () => ctx.get('llm'),
+    logger: ctx.logger,
+  })
+  const disposeAdaptersUpdated = ctx.on('llm/adapters-updated', () => { providerCheck.observe() })
   /** Session id -> the route its last request used, for failover and the chip. */
   const usedRoutes = new Map()
   /**
@@ -181,6 +194,7 @@ export function apply(ctx, config = {}) {
   async function pickRoute(poolName) {
     const pool = routes.pools[poolName]
     if (pool === undefined) return undefined
+    providerCheck.assertRoutable(pool)
     // Only the pool's own providers are probed: a route a pool cannot use is not
     // worth a round trip before a delegation.
     await balances.refreshStale({ wait: true, providers: pool.routes.map(route => route.provider) })
@@ -585,13 +599,16 @@ export function apply(ctx, config = {}) {
   function reportRoutes(only) {
     const report = routeState.report(Date.now())
     const shown = only === '' ? report : report.filter(pool => pool.name === only)
+    const misconfigured = providerCheck.describe()
+    const blocks = misconfigured === undefined ? [] : [misconfigured, '']
     if (shown.length === 0) {
       const names = report.map(pool => pool.name)
-      return only === ''
+      blocks.push(only === ''
         ? 'no route pools are configured'
-        : `no pool named "${only}"; configured pools: ${names.length === 0 ? '(none)' : names.join(', ')}`
+        : `no pool named "${only}"; configured pools: ${names.length === 0 ? '(none)' : names.join(', ')}`)
+      return blocks.join('\n')
     }
-    return shown.map((pool) => {
+    blocks.push(...shown.map((pool) => {
       const lines = pool.routes.map((route) => {
         const reading = route.reading
         const balance = reading === undefined
@@ -604,7 +621,8 @@ export function apply(ctx, config = {}) {
         return `  ${route.usable ? 'ok ' : 'no '} ${route.provider}/${route.model} — ${balance}${mark}`
       })
       return `pool "${pool.name}":\n${lines.join('\n')}`
-    }).join('\n')
+    }))
+    return blocks.join('\n')
   }
 
   /**
@@ -706,11 +724,13 @@ export function apply(ctx, config = {}) {
       case 'report':
         return { kind: 'success', text: reportPool(session) }
       case 'set': {
-        setPool(session, parsed.pool)
-        // The status line names what the pool answers now, so a person choosing
-        // one sees which route the next request takes. This is a user action, so
-        // it may wait for the pool's own providers to be read.
+        // The status line names what the pool answers now, so a person choosing one
+        // sees which route the next request takes. This is a user action, so it may
+        // wait for the pool's own providers to be read — and it runs before
+        // `setPool`, so a pool that cannot route leaves no half-applied choice
+        // behind.
         const chosen = await pickRoute(parsed.pool)
+        setPool(session, parsed.pool)
         return {
           kind: 'success',
           text: `route pool "${parsed.pool}" governs this session; its next request uses `
@@ -799,6 +819,7 @@ export function apply(ctx, config = {}) {
     disposeSuccessListener()
     disposeRequestError()
     disposeRequest()
+    disposeAdaptersUpdated()
     lifetime.abort(new Error('llm-quota-retry plugin disposed'))
     await Promise.allSettled([...active])
     ledger.clear()

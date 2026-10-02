@@ -198,22 +198,69 @@ provider, no dependencies, each printing one JSON reading on stdout.
     pools:
       medium:
         routes:
-          - { provider: opencode-go, model: deepseek-v4.1-flash, reasoningEffort: high }
-          - { provider: command-code-goat, model: deepseek/deepseek-v4.1-flash, reasoningEffort: high }
+          - { provider: gateway-a, model: flash-1, reasoningEffort: high }
+          - { provider: gateway-b, model: flash-1, reasoningEffort: high }
     balances:
-      - provider: opencode-go
-        script: ['node', 'C:/resource/dsh-balance/opencode-go.mjs']
-        apiKeyEnv: OPENCODE_API_KEY   # resolved through the credential service, then forwarded
+      - provider: gateway-a
+        script: ['node', 'C:/resource/dsh-balance/gateway-a.mjs']
+        apiKeyEnv: GATEWAY_A_API_KEY      # resolved through the credential service, then forwarded
         unit: percent             # what `remaining` counts, for a person reading it
         minimumRemaining: 5       # below this a route is not chosen, and never one already running
         refreshMs: 60000
         timeoutMs: 5000
-      - provider: command-code-goat
-        script: ['node', 'C:/resource/dsh-balance/command-code-goat.mjs']
-        apiKeyEnv: COMMAND_CODE_GOAT_API_KEY
+      - provider: gateway-b
+        script: ['node', 'C:/resource/dsh-balance/gateway-b.mjs']
+        apiKeyEnv: GATEWAY_B_API_KEY
         unit: usd-left
         minimumRemaining: 1
 ```
+
+### A route's provider is the harness's provider id
+
+`provider` is the route key the harness resolves a model request through — the id
+itself passes to `ctx.llm`, not a provider's own marketing name and not the id some
+SDK underneath happens to use internally. A provider plugin registers one such id,
+and the name of its package, its row, or the vendor is not automatically that id.
+
+This is the one mistake in this file that cannot be caught from here, so the
+plugin checks it rather than trusting it: see
+[the provider check](#the-provider-check).
+
+### The provider check
+
+A route's provider is written verbatim into the `model/selection` event this
+plugin emits, so a name no adapter serves does not fail where it was written — it
+fails later, on somebody's model request, as the harness's `NO_ADAPTER`. The plugin
+therefore holds every provider name in `pools` and `balances` against the adapters
+the composition registered, and reports a mismatch once rather than on every
+announcement:
+
+```
+llm-quota-retry: no LLM adapter is registered for provider "opencode-go" (named by
+pools.medium.routes[0], balances[0]); a model request on one of them fails with
+NO_ADAPTER. Registered providers: command-code-goat, dsh-opencode-go, kimi-coding
+```
+
+**When it reports.** Composition order decides when each adapter registers, and a
+provider plugin composed after this row registers its adapter after `apply()` has
+returned — so a name missing at activation says nothing about whether it will ever
+arrive. Nothing in the harness announces that a composition has finished, so the
+check answers at the earliest point that can: it follows every
+`llm/adapters-updated` announcement but reports from one only when **two
+consecutive announcements agree on the missing set** — every announcement
+registers at least one adapter, so an unchanged set means no configured provider
+is still on its way. Failing that, the first request to route settles it, which is
+also the moment the defect matters.
+
+**What it does to routing.** A pool whose routes name a provider no adapter serves
+is **refused**: `pickRoute` throws for it, naming the pool and the provider, and
+the session that asked is not put in the pool. A *balance source* naming one is
+not refused — a balance name is only a lookup key into this plugin's own readings,
+so a mismatch there costs a reading rather than a request and a deployment whose
+balance script is misnamed still delegates.
+
+`/quota-routes` prints the same sentence above the pools, so the state a person
+reads names the same defect the log does.
 
 ### The balance script contract
 
@@ -355,7 +402,9 @@ in-memory: it exists only while a wait is live.
 // Choose the route a session that does not exist yet should start on. Refreshes
 // that pool's stale readings first, so it may wait up to the slowest of THEIR
 // scripts' `timeoutMs`. `undefined` means no pool by that name exists — a config
-// error at the caller.
+// error at the caller. It rejects when a route of the pool names a provider no
+// adapter serves, which is also a config error at the caller; see
+// [the provider check](#the-provider-check).
 const route = await ctx.llmQuotaRetry.pickRoute('medium')
 // route.provider, route.model, route.reasoningEffort?
 
@@ -509,11 +558,11 @@ export function apply(ctx) {
 
 ## Hot reload
 
-Listing `index.js`, `client.js`, `lib/policy.js`, `lib/routes.js`, and
-`lib/balance.js` in the profile's `hmr` roots makes an edit to any of them
-replace the module generation in a running host: the plugin is disposed and
-re-imported, and `apply()` re-runs. A module missing from that list silently
-never reloads, so keep the list in step with the files.
+Listing `index.js`, `client.js`, `lib/policy.js`, `lib/routes.js`,
+`lib/balance.js`, and `lib/providers.js` in the profile's `hmr` roots makes an
+edit to any of them replace the module generation in a running host: the plugin is
+disposed and re-imported, and `apply()` re-runs. A module missing from that list
+silently never reloads, so keep the list in step with the files.
 The in-memory retry state does not survive a reload — it drops a pending wait and
 its entry, and with them every reading and exhaustion mark, exactly as a restart
 does; the next requests re-derive them. The durable per-session switch and route
