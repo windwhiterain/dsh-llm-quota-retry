@@ -243,7 +243,7 @@ use it.
 | `longTermDelayMs` | `3600000` | Interval between long-term attempts, in milliseconds. Must be a positive finite number no greater than `2147483647`. |
 | `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes the whole allowance response opt-in. |
 | `nativeRetryFirstProviders` | none | Provider ids whose exhausted allowance runs the provider's own native retry schedule first. See [the named provider](#native-quick-retries-for-a-named-provider). |
-| `pools` | none | Named, ordered route lists a session may be moved between. See below. |
+| `pools` | none | Named, ordered route lists a session may be moved between. Each pool is `routes` plus, optionally, `midSessionSwitch: false` to refuse the moves this plugin makes on its own. See below. |
 | `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with, the `coefficients` weighing each window it reports, the `capacities` a window the script leaves without one divides by, and the `capacity` a reading with no window divides by. See below. |
 | `failOpen` | `true` | Whether a route nothing reported on counts as usable. `false` makes an unread provider unusable, so only a route a script vouches for is ever chosen. |
 | `exhaustedCooldownMs` | `3600000` | How long a provider stays marked after a request failed with an exhausted allowance. Must be a positive finite number no greater than `2147483647`. |
@@ -279,6 +279,11 @@ provider, no dependencies, each printing one JSON reading on stdout.
         routes:
           - { provider: gateway-a, model: flash-1, reasoningEffort: high }
           - { provider: gateway-b, model: flash-1, reasoningEffort: high }
+      advice:
+        midSessionSwitch: false   # interchangeable to start on, never swapped under a live session
+        routes:
+          - { provider: gateway-a, model: model-max, reasoningEffort: high }
+          - { provider: gateway-b, model: model-max, reasoningEffort: high }
     balances:
       - provider: gateway-a
         script: ['node', 'C:/resource/dsh-balance/gateway-a.mjs']
@@ -467,19 +472,39 @@ rule — the draw over the routes that are not out of allowance and clear their 
 threshold, or failing that the first route that is merely not out of allowance,
 because a route with little left can still be the one that answers.
 
+**A pool can refuse that move.** `midSessionSwitch: false` on a pool means its
+routes are interchangeable for the session that *starts* on one, never for the
+session already running on it: an exhausted provider is waited out where it is
+instead of being swapped for a different model mid-conversation, and no
+`llm-quota-retry/failover` is announced. It governs **only the moves this plugin
+makes on its own** — the failure-time failover and the per-request replacement.
+A move the user asks for is not that decision and is unaffected: the model
+picker, `/quota-pool <name>`, and the composer chip all still move a session,
+and `pickRoute` still draws a starting route for every new session and every
+delegated child. Use it for a pool whose routes are different *models* rather
+than the same model behind several accounts, where the swap costs a prompt cache
+and a change of behavior the conversation did not ask for.
+
+| Pool | `midSessionSwitch` | What a session already running on one of its routes does when that provider runs out |
+|---|---|---|
+| `medium` (default) | on | Moves to another route of the pool and retries at once. |
+| `advice` | off | Keeps its route and waits out the interval; only the user moves it. |
+
 ### What happens to a session
 
 - **At the end of a step**, before any waiting: a request that failed with an
   exhausted allowance marks its provider and looks for a usable route in the
   session's pool. One found means the retry goes there **at once**, announced as
   `llm-quota-retry/failover`; none found means the long-term wait, exactly as
-  before.
+  before. A pool that refuses mid-session switching is one of the ways none is
+  found.
 - **At every request**, the route the session would otherwise use is replaced
   when its provider has **reported the allowance spent**, and the pool holds a
   route that has not. This decision reads cached readings and marks only — it
   starts no script and waits for nothing, because a model request must never be
   held behind a balance probe. A reading below a route's threshold does not move
-  an open session (see "How a route is chosen"), and a route the user picked in
+  an open session (see "How a route is chosen"), a pool that refuses mid-session
+  switching never moves it here either, and a route the user picked in
   the model picker is left alone as soon as it falls outside the session's pool.
 - **Which pool governs a session**: the one the session states (`/quota-pool`,
   the chip, or the delegation plugin that created it), or — when it states none —

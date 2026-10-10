@@ -379,6 +379,43 @@ check('an exhausted pool with no candidate leaves the session where it is', () =
   assert.equal(state.replacementFor('medium', { provider: 'third', model: 'three' }, now), undefined)
 })
 
+check('a pool that refuses mid-session switching still chooses a starting route', () => {
+  const routes = resolveRoutes({
+    pools: {
+      held: {
+        midSessionSwitch: false,
+        routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }],
+      },
+      open: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] },
+    },
+    balances: [{ provider: 'second', script: ['s'], minimumRemaining: 1, capacity: 100 }],
+  })
+  assert.equal(routes.pools.held.midSessionSwitch, false)
+  assert.equal(routes.pools.open.midSessionSwitch, true, 'a pool that says nothing still switches')
+
+  const state = new RouteState(routes, () => 0.99)
+  state.noteReading('second', { remaining: 50 }, 0)
+  assert.deepEqual(state.pick('held', 0), { provider: 'second', model: 'two' },
+    'choosing the route a Session starts on is not a mid-session switch')
+  state.noteExhausted('first', 0)
+  assert.equal(
+    state.replacementFor('held', { provider: 'first', model: 'one' }, 0),
+    undefined,
+    'an exhausted provider of such a pool is waited out where it is',
+  )
+  assert.deepEqual(
+    state.replacementFor('open', { provider: 'first', model: 'one' }, 0),
+    { provider: 'second', model: 'two' },
+    'the same routes in a pool that switches behave as before',
+  )
+
+  assert.throws(() => resolveRoutes({ pools: { held: { midSessionSwitch: 'no', routes: [{ provider: 'p', model: 'm' }] } } }), /midSessionSwitch must be a boolean/)
+  assert.equal(
+    resolveRoutes({ pools: { held: { routes: [{ provider: 'p', model: 'm' }] } } }).pools.held.midSessionSwitch,
+    true,
+  )
+})
+
 check('the report carries each route\'s reading, score, and mark', () => {
   const state = new RouteState(POLICY)
   state.noteReading('second', { remaining: 7, resetsAt: 'later' }, 1_000)

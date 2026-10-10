@@ -973,6 +973,54 @@ check('a failover draws from the scored routes, and an unread one is only a fall
   )
 })
 
+check('a pool that refuses mid-session switching waits where the session is', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: {
+      held: {
+        midSessionSwitch: false,
+        routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }],
+      },
+    },
+  })
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'first', model: 'one' }), {
+    provider: 'first',
+    model: 'one',
+  }, 'the route a session starts on is still the pool\'s to choose')
+  const pending = dispatchFailure(context, { ...request, provider: 'first' })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(
+    context.emitted.some(entry => entry.event === 'llm-quota-retry/failover'),
+    false,
+    'the plugin does not move a session of a pool that refuses it',
+  )
+  assert.equal(enteredOf(context).length, 1, 'the exhausted allowance is waited out where it is')
+  await context.dispose()
+  assert.equal(await pending, undefined)
+})
+
+check('a pool that refuses mid-session switching still moves a session the user puts in it', async () => {
+  const context = createContext()
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: {
+      held: {
+        midSessionSwitch: false,
+        routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }],
+      },
+    },
+  })
+  await dispatchRequest(context, agent, { provider: 'third', model: 'three' })
+  const outcome = await context.commands.runNamed('quota-pool', 'held', agent)
+  assert.equal(outcome.kind, 'success')
+  assert.deepEqual(
+    await dispatchRequest(context, agent, { provider: 'third', model: 'three' }),
+    { provider: 'first', model: 'one' },
+    'setting the pool is the user asking for its route, which the refusal does not cover',
+  )
+})
+
 check('/quota-pool states a pool, and the next request moves into it', async () => {
   const context = createContext()
   apply(context, {
