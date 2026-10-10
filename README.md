@@ -118,6 +118,16 @@ where the native policy, not this plugin, owns the step:
   simply lack: without `@deepseek-ai/dsh-llm-retry` the quick schedule runs, and
   with a native policy that never spent its budget, so does it.
 
+**A balance reading is deliberately not a fourth rule.** qwen answers the same
+`insufficient_quota` failure whether the plan is spent or the request was merely
+throttled, so a reading showing nothing left cannot tell those two apart — and
+the quick retry is the only thing that lets a throttled request recover in
+seconds. Skipping the schedule for a low reading would turn one conflated error
+into an immediate failover, which is the opposite of what this list is for. The
+cost stays bounded and visible instead: a provider that really has nothing left
+spends one step's schedule and the long-term wait follows. Shortening that
+schedule is the provider's own `maxRetries` and `maxDelayMs`, not a rule here.
+
 The quick budget is counted per step, like the native one: a step that runs out
 of it enters the long-term wait, and the next step starts a fresh budget.
 
