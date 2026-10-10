@@ -35,8 +35,10 @@
  * comes from balance scripts (`balances`: one command per provider printing one
  * JSON object on stdout) and from the providers that reported exhaustion
  * themselves, so a deployment whose providers publish no balance endpoint still
- * fails over rather than waiting an hour. A Session with the switch off is not
- * moved. See the README's "Route pools and balance sources".
+ * fails over rather than waiting an hour. A route is drawn with a probability
+ * proportional to what it has left, so a pool is spent in proportion to its
+ * allowance instead of drained route by route. A Session with the switch off is
+ * not moved. See the README's "Route pools and balance sources".
  *
  * Which pool governs a Session is a setting of its own, in the same record and
  * with the same inheritance: written through `/quota-pool` or the composer chip
@@ -125,8 +127,10 @@ const PASSTHROUGH_SCHEMA = { parse: value => value }
  *   reported on means, and `exhaustedCooldownMs` how long a provider stays
  *   marked after it reported exhaustion. Unknown keys and invalid values throw
  *   at activation.
+ * @param internals - non-serializable hooks; `random` makes the proportional
+ *   route choice deterministic for a probe.
  */
-export function apply(ctx, config = {}) {
+export function apply(ctx, config = {}, internals = {}) {
   const policy = resolvePolicy(config, ROUTE_CONFIG_KEYS)
   const routes = resolveRoutes(config)
   /** Every configured pool name, in configured order, as the chips list them. */
@@ -142,7 +146,7 @@ export function apply(ctx, config = {}) {
       + `${RESERVED_POOL_NAMES.join(', ')} itself`,
     )
   }
-  const routeState = new RouteState(routes)
+  const routeState = new RouteState(routes, internals.random ?? Math.random)
   const ledger = new QuotaRetryLedger()
   const lifetime = new AbortController()
   const active = new Set()
@@ -202,6 +206,10 @@ export function apply(ctx, config = {}) {
    * because that is a configuration error at the caller rather than a route
    * choice, and the caller reports it as one.
    *
+   * The answer is drawn with a probability proportional to what each usable
+   * route has left, so a pool is spent across its routes rather than drained
+   * route by route — see the README's "How a route is chosen".
+   *
    * @param poolName - the pool to choose from.
    * @returns the chosen route, or undefined when no pool by that name exists.
    */
@@ -214,9 +222,19 @@ export function apply(ctx, config = {}) {
     await balances.refreshStale({ wait: true, providers: pool.routes.map(route => route.provider) })
     const chosen = routeState.pick(poolName, Date.now())
     ctx.logger.info(
-      `llm-quota-retry: pool "${poolName}" answers ${chosen.provider}/${chosen.model}`,
+      `llm-quota-retry: pool "${poolName}" answers ${chosen.provider}/${chosen.model}`
+      + `${describeScore(routeState.scoreOf(chosen.provider))}`,
     )
     return chosen
+  }
+
+  /**
+   * One route's headroom, worded for a log line or a report.
+   * @param score - the route's score, absent when nothing can be scored.
+   * @returns the phrase to append, empty when there is no score.
+   */
+  function describeScore(score) {
+    return score === undefined ? '' : ` (score ${score.toFixed(3)})`
   }
 
   /**
@@ -712,7 +730,8 @@ export function apply(ctx, config = {}) {
         const mark = route.exhaustedAt === undefined
           ? ''
           : ` [exhausted ${new Date(route.exhaustedAt).toISOString()}]`
-        return `  ${route.usable ? 'ok ' : 'no '} ${route.provider}/${route.model} — ${balance}${mark}`
+        return `  ${route.usable ? 'ok ' : 'no '} ${route.provider}/${route.model} — ${balance}`
+          + `${describeScore(route.score)}${mark}`
       })
       return `pool "${pool.name}":\n${lines.join('\n')}`
     }))

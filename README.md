@@ -9,7 +9,8 @@ When a model request fails because the account is out of allowance, the ordinary
 recovery policy gives up once its retry budget is spent and the turn ends. This
 plugin takes over at that point. If the session's **route pool** — a named,
 ordered list of interchangeable provider/model pairs — has a route with
-allowance, the retry goes there immediately; if none has, the same request is
+allowance, the retry goes there immediately, drawn in proportion to what each
+route has left; if none has, the same request is
 retried inside the same open turn once per configured interval — one hour by
 default, with no attempt limit — until a request succeeds or the turn is
 cancelled. It is on by default for every session: turn it off per session through
@@ -212,8 +213,8 @@ Three states, deliberately distinct:
 
 **Choosing a pool chooses a route.** The moment a session is put in a pool — by
 the command, by the chip, or by the delegation plugin that created it from a
-pooled template — the plugin picks a route from it (the threshold applies: the
-first route that clears its own `minimumRemaining`) and the session's next
+pooled template — the plugin draws a route from it (each usable route in
+proportion to what it has left, so the threshold applies) and the session's next
 request uses it, even when the model it is on belongs to no pool. That choice is
 recorded on the session itself, as the `model/selection` event the model picker
 writes, so the Client's picker shows the route actually in use. After that the
@@ -233,7 +234,7 @@ use it.
 | `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes the whole allowance response opt-in. |
 | `nativeRetryFirstProviders` | none | Provider ids whose exhausted allowance runs the provider's own native retry schedule first. See [the named provider](#native-quick-retries-for-a-named-provider). |
 | `pools` | none | Named, ordered route lists a session may be moved between. See below. |
-| `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with. See below. |
+| `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with, the `coefficients` weighing each window it reports, and the `capacity` a reading with no window divides by. See below. |
 | `failOpen` | `true` | Whether a route nothing reported on counts as usable. `false` makes an unread provider unusable, so only a route a script vouches for is ever chosen. |
 | `exhaustedCooldownMs` | `3600000` | How long a provider stays marked after a request failed with an exhausted allowance. Must be a positive finite number no greater than `2147483647`. |
 
@@ -276,11 +277,15 @@ provider, no dependencies, each printing one JSON reading on stdout.
         minimumRemaining: 5       # below this a route is not chosen, and never one already running
         refreshMs: 60000
         timeoutMs: 5000
+        coefficients:             # how the windows this script reports are weighed
+          five-hour: 1            # a window the map does not name weighs 1
+          monthly: 0.25           # a month of credits matters a quarter as much
       - provider: gateway-b
         script: ['node', 'C:/resource/dsh-balance/gateway-b.mjs']
         apiKeyEnv: GATEWAY_B_API_KEY
         unit: usd-left
         minimumRemaining: 1
+        capacity: 20              # this script reports no window: 20 usd counts as full
 ```
 
 ### A route's provider is the harness's provider id
@@ -338,7 +343,15 @@ subprocess service, with the working directory the host was started in. It
 should print **one JSON object on stdout**:
 
 ```json
-{ "remaining": 42.5, "resetsAt": "2026-10-01T00:00:00Z" }
+{
+  "remaining": 2.94,
+  "windows": [
+    { "name": "five-hour", "remaining": 14, "capacity": 14 },
+    { "name": "weekly", "remaining": 2.94, "capacity": 35 },
+    { "name": "monthly", "remaining": 37.94 }
+  ],
+  "resetsAt": "2026-10-01T00:00:00Z"
+}
 ```
 
 `remaining` is what the provider has left in whatever unit the row's `unit` field
@@ -347,10 +360,23 @@ provider that reports *used* percentage converts it (`remaining = 100 - used`)
 before printing. `resetsAt` is optional context for a person; a provider's own
 refusal can be reported with `error` alongside a reading.
 
+`windows` is optional, and it is what ranks one route against another: a plan
+meters several windows (a five-hour cap, a week, a month), and the one that will
+refuse the next request is the one to go by. Each entry names its own window
+(`name`), reports what is left of it (`remaining`), and reports that window's
+full allowance (`capacity`) when the provider publishes one. A window's
+`remaining` is in that window's own unit; the plugin divides it by that same
+window's `capacity`, so a percentage plan and a wallet in another currency
+compare. A window without a `capacity` — a prepaid wallet, a monthly credit an
+endpoint reports only as an amount — is kept for the person reading
+`/quota-routes` and skipped by the ranking.
+
 Everything else is a **missing reading**, not an error: a non-zero exit, a
 timeout (`timeoutMs`), output that is not that JSON object, or no subprocess
 service in the composition. A missing reading never stops a request — it is the
-exhaustion mark, not a probe, that keeps a spent provider out of the way.
+exhaustion mark, not a probe, that keeps a spent provider out of the way. A
+malformed `windows` entry is dropped rather than failing the reading; the top
+level `remaining` is what the row's `minimumRemaining` still measures.
 
 The script owns its requests, and this plugin forwards it only what the row names.
 `apiKeyEnv` is the credential it should use: the plugin resolves that reference
@@ -387,17 +413,39 @@ is on cannot answer at all.
 3. **A route nothing reported on** is usable when `failOpen` is on (the default),
    and unusable when it is off.
 
-Declared order breaks ties, and a pool whose routes are *all* unusable still
-answers with its first route: a request has to run somewhere, and the long-term
-wait covers the case where every route refuses it. Only a pool the configuration
-never declared is an error, and the caller that named it reports it as one.
+**Among the usable routes, the one drawn is proportional to what it has left.**
+A reading is scored as a fraction of the allowance that binds it — the **worst**
+of its `windows`, each weighed by the row's own `coefficients` — and the draw
+puts a route in the pool's range in proportion to that score. A route with twice
+the headroom of another is drawn twice as often, so a pool is spent across its
+routes instead of drained route by route, and the next request still goes to
+whichever route the draw lands on rather than to the one with the most left.
+
+| Case | What decides |
+|---|---|
+| The row names one or more scored windows | The lowest `remaining / capacity × coefficient` over the windows that carry a `capacity` |
+| The reading has no scorable window | The whole reading against the row's `capacity`, when the row declares one |
+| Neither | The route is unscored, and undrawable while any scored route of the pool is usable |
+| Nothing in the pool is scored | Declared order: the first usable route, exactly as before |
+
+Declared order also breaks the tie between two equally scored routes, and a pool
+whose routes are *all* unusable still answers with its first route: a request has
+to run somewhere, and the long-term wait covers the case where every route
+refuses it. Only a pool the configuration never declared is an error, and the
+caller that named it reports it as one.
+
+The coefficients are how a deployment says which window matters. `monthly: 0.25`
+means a month of credits counts for a quarter of what the same fraction of a
+five-hour cap counts for; `0` drops a window from the score entirely. A window
+name the map does not mention weighs `1`, so a row that declares no
+`coefficients` weighs every window equally.
 
 **Leaving a route** needs one thing: the provider itself reporting the allowance
 spent. A reading below the threshold does not move a session that has already
-started, and neither does a pool reordering. The move is then made the way a
-choice is — the first route in declared order that is not out of allowance and
-clears its own threshold, or failing that any route that is merely not out of
-allowance — because a route with little left can still be the one that answers.
+started, and neither does a pool reordering. The move is then made by the same
+rule — the draw over the routes that are not out of allowance and clear their own
+threshold, or failing that the first route that is merely not out of allowance,
+because a route with little left can still be the one that answers.
 
 ### What happens to a session
 
@@ -424,10 +472,12 @@ allowance — because a route with little left can still be the one that answers
   pool never probes a provider it cannot use and the wait is bounded by the
   slowest script in that pool. This
   is the delegation-time half: `dsh-subagent-templates` templates name a pool and
-  call it for every child they create.
+  call it for every child they create — one route per child, drawn in proportion
+  to headroom, so two subagents of one template start on different routes without
+  anyone choosing between them.
 
 `/quota-routes [pool]` prints the same state a person needs: each pool, each
-route, its last reading, and its exhaustion mark.
+route, its last reading, its score when it has one, and its exhaustion mark.
 
 ### Pool names
 
@@ -467,11 +517,13 @@ in-memory: it exists only while a wait is live.
 **The route surface**, on the same service:
 
 ```js
-// Choose the route a session that does not exist yet should start on. Refreshes
-// that pool's stale readings first, so it may wait up to the slowest of THEIR
-// scripts' `timeoutMs`. `undefined` means no pool by that name exists — a config
-// error at the caller. It rejects when a route of the pool names a provider no
-// adapter serves, which is also a config error at the caller; see
+// Choose the route a session that does not exist yet should start on: one draw
+// over the pool's usable routes, each in proportion to what it has left, so two
+// calls can answer differently by design. Refreshes that pool's stale readings
+// first, so it may wait up to the slowest of THEIR scripts' `timeoutMs`.
+// `undefined` means no pool by that name exists — a config error at the caller.
+// It rejects when a route of the pool names a provider no adapter serves, which
+// is also a config error at the caller; see
 // [the provider check](#the-provider-check).
 const route = await ctx.llmQuotaRetry.pickRoute('medium')
 // route.provider, route.model, route.reasoningEffort?
@@ -485,7 +537,7 @@ ctx.llmQuotaRetry.setPool(childSession, 'medium')
 // route belongs to; undefined when none does.
 const pool = ctx.llmQuotaRetry.poolOf(session)
 
-// Every pool, route, reading, and mark — what `/quota-routes` prints.
+// Every pool, route, reading, score, and mark — what `/quota-routes` prints.
 const report = ctx.llmQuotaRetry.report()
 ```
 
@@ -592,6 +644,11 @@ export function apply(ctx) {
   The failed request itself already cost what it cost; the retry on the pool's
   next usable route is one more request, which is the point of configuring a
   pool. `llm-quota-retry/failover` announces every such move.
+- **Two identical sessions can start on different routes.** The route a pool
+  answers with is drawn in proportion to headroom rather than taken from the top
+  of a ranking, so a deployment with several routes spreads its work instead of
+  draining the richest one; only a pool with nothing scored falls back to the
+  declared order. The draw is what the score shown by `/quota-routes` weighs.
 - **The session stays busy.** A long-term wait holds the open step, so the turn
   does not reach quiescence and the session reports as running until a request
   succeeds or the turn is cancelled.
@@ -672,18 +729,21 @@ that is moved off an exhausted provider, the immediate retry a pool with
 allowance produces, the long-term wait a pool without one still uses, the switch
 that stops both, the pool setting (stated, inferred, opted out, inherited, and
 restored from storage), the `model/selection` event a chosen route is recorded
-as, the balance scripts seen through a fake subprocess service, and the
-native-first provider list: which providers qualify, the waits it schedules, and
-the long-term entry it hands over to once that budget is spent.
+as, the balance scripts seen through a fake subprocess service, the draw that
+sends a session to a route in proportion to its headroom (driven through an
+injected `random`, so the choice is exact), and the native-first provider list:
+which providers qualify, the waits it schedules, and the long-term entry it hands
+over to once that budget is spent.
 
 ```sh
 node probe/probe.mjs
 ```
 
 `probe/routes.probe.mjs` drives the route policy alone — config validation, the
-balance-output contract, fail-open vs fail-closed, exhaustion marks and their
-cooldown, pool inference, and the choice itself — with no context, no subprocess,
-and no clock:
+balance-output contract (including the windows a reading carries and the
+coefficients and capacity a row declares), the score a reading earns, fail-open
+vs fail-closed, exhaustion marks and their cooldown, pool inference, and the
+proportional draw itself — with no context, no subprocess, and no clock:
 
 ```sh
 node probe/routes.probe.mjs
@@ -702,7 +762,8 @@ none runs a real balance script. Confirming the composed behavior against a real
 provider requires either an account that actually runs out of balance or an
 OpenAI-compatible endpoint that answers `402` with insufficient-balance wording;
 the balance contract is confirmed by running a script by hand and comparing its
-stdout with `{"remaining": …}`.
+stdout with `{"remaining": …}` and its `windows`. What a real pool then does with
+those readings — which route a draw lands on — is what `/quota-routes` shows.
 
 ## License
 

@@ -889,6 +889,90 @@ check('choosing a route probes only that pool\'s providers', async () => {
   assert.equal(scripts.spawned.length, 2)
 })
 
+check('pickRoute draws a route in proportion to what each one has left', async () => {
+  const scripts = createSubprocess([
+    JSON.stringify({ remaining: 90, windows: [{ name: 'five-hour', remaining: 90, capacity: 100 }] }),
+    JSON.stringify({ remaining: 30, windows: [{ name: 'five-hour', remaining: 30, capacity: 100 }] }),
+  ])
+  const context = createContext({ subprocess: scripts })
+  let draw = 0.5
+  apply(context, {
+    longTermDelayMs: 5,
+    pools: { medium: { routes: [{ provider: 'rich', model: 'r' }, { provider: 'poor', model: 'p' }] } },
+    balances: [
+      { provider: 'rich', script: ['probe-script'] },
+      { provider: 'poor', script: ['probe-script'] },
+    ],
+  }, { random: () => draw })
+
+  // Weights 0.9 and 0.3: the first three quarters of the range are the richer route.
+  assert.deepEqual(await context.service.pickRoute('medium'), { provider: 'rich', model: 'r' })
+  draw = 0.76
+  assert.deepEqual(await context.service.pickRoute('medium'), { provider: 'poor', model: 'p' },
+    'the rest of the range belongs to the poorer route')
+
+  const report = context.service.report()
+  assert.equal(report[0].routes[0].score, 0.9)
+  assert.equal(report[0].routes[1].score, 0.3)
+  const text = (await context.commands.runNamed('quota-routes', 'medium')).text
+  assert.match(text, /rich\/r — 90 \(score 0\.900\)/)
+  assert.match(text, /poor\/p — 30 \(score 0\.300\)/)
+})
+
+check('a failover draws from the scored routes, and an unread one is only a fallback', async () => {
+  const medium = {
+    routes: [
+      { provider: 'first', model: 'one' },
+      { provider: 'second', model: 'two' },
+      { provider: 'third', model: 'three' },
+    ],
+  }
+
+  /**
+   * Read the pool, then fail the first route and answer where the retry went.
+   * @param draw - the sample the proportional choice is given.
+   * @param readings - one script output per balance row, in declared order.
+   * @param balances - the balance rows of this scenario.
+   * @returns the provider the failed request was moved to.
+   */
+  async function failoverFrom(draw, readings, balances) {
+    const context = createContext({ subprocess: createSubprocess([...readings]) })
+    apply(context, { longTermDelayMs: 60_000, pools: { medium }, balances }, { random: () => draw })
+    await context.service.pickRoute('medium')
+    await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+    const before = context.emitted.length
+    assert.deepEqual(await dispatchFailure(context, { ...request, provider: 'first' }), { kind: 'retry' })
+    const moved = context.emitted.slice(before).find(entry => entry.event === 'llm-quota-retry/failover')
+    assert.ok(moved !== undefined, 'the failed request moved to another route of its pool')
+    return moved.payload.to.provider
+  }
+
+  const readings = [
+    '{"remaining": 80, "windows": [{"name": "weekly", "remaining": 80, "capacity": 100}]}',
+    '{"remaining": 40, "windows": [{"name": "weekly", "remaining": 40, "capacity": 100}]}',
+    '{"remaining": 20, "windows": [{"name": "weekly", "remaining": 20, "capacity": 100}]}',
+  ]
+  const balances = [
+    { provider: 'first', script: ['probe-script'] },
+    { provider: 'second', script: ['probe-script'] },
+    { provider: 'third', script: ['probe-script'] },
+  ]
+  assert.equal(await failoverFrom(0.99, readings, balances), 'third',
+    'the two weights left add up to the whole range, and the smaller one holds its end')
+  assert.equal(await failoverFrom(0.5, readings, balances), 'second',
+    'half of the range is the route with half the headroom of the one above it')
+
+  assert.equal(
+    await failoverFrom(
+      0.999,
+      [readings[0]],
+      [{ provider: 'first', script: ['probe-script'] }],
+    ),
+    'second',
+    'an unread route is unknown rather than plentiful, so declared order decides between two of them',
+  )
+})
+
 check('/quota-pool states a pool, and the next request moves into it', async () => {
   const context = createContext()
   apply(context, {

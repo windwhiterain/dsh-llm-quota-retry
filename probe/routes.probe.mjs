@@ -42,6 +42,33 @@ const POLICY = resolveRoutes({
   ],
 })
 
+/** One resolved policy whose three routes carry readings that can be weighed. */
+const SCORED = resolveRoutes({
+  pools: {
+    medium: {
+      routes: [
+        { provider: 'rich', model: 'r' },
+        { provider: 'poor', model: 'p' },
+        { provider: 'unread', model: 'u' },
+      ],
+    },
+  },
+  balances: [
+    { provider: 'rich', script: ['s'], coefficients: { monthly: 0.5 } },
+    { provider: 'poor', script: ['s'], capacity: 10 },
+  ],
+})
+
+/**
+ * A random source a check drives: `box.value` answers the next draw.
+ * @param value - the first sample.
+ * @returns the source and the box a check writes the next sample into.
+ */
+function fixedRandom(value) {
+  const box = { value }
+  return { box, random: () => box.value }
+}
+
 check('config: pools and balance sources resolve, with their defaults', () => {
   const routes = resolveRoutes({
     pools: { medium: { routes: [{ provider: 'p', model: 'm' }] } },
@@ -53,7 +80,31 @@ check('config: pools and balance sources resolve, with their defaults', () => {
   assert.equal(routes.balances[0].timeoutMs, DEFAULT_BALANCE_TIMEOUT_MS)
   assert.equal(routes.balances[0].refreshMs, DEFAULT_BALANCE_REFRESH_MS)
   assert.deepEqual(routes.balances[0].env, {})
-  assert.deepEqual(resolveRoutes({}), { balances: [], pools: {}, failOpen: true, exhaustedCooldownMs: DEFAULT_EXHAUSTED_COOLDOWN_MS, minimumOf: {}, refreshOf: {} })
+  assert.deepEqual(routes.balances[0].coefficients, {}, 'a row without coefficients weighs every window equally')
+  assert.deepEqual(resolveRoutes({}), {
+    balances: [],
+    pools: {},
+    failOpen: true,
+    exhaustedCooldownMs: DEFAULT_EXHAUSTED_COOLDOWN_MS,
+    minimumOf: {},
+    refreshOf: {},
+    coefficientOf: {},
+    capacityOf: {},
+  })
+})
+
+check('config: window coefficients and a whole-reading capacity resolve, or fail the row', () => {
+  const routes = resolveRoutes({
+    balances: [{ provider: 'p', script: ['s'], coefficients: { 'five-hour': 2, monthly: 0 }, capacity: 10 }],
+  })
+  assert.deepEqual(routes.coefficientOf.p, { 'five-hour': 2, monthly: 0 })
+  assert.equal(routes.capacityOf.p, 10)
+  assert.equal(routes.capacityOf.q, undefined, 'a provider without a capacity has none to divide by')
+  assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], coefficients: 1 }] }), /coefficients must be an object/)
+  assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], coefficients: { a: -1 } }] }), /coefficients\.a must be a non-negative/)
+  assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], coefficients: { '': 1 } }] }), /must not name an empty window/)
+  assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], capacity: 0 }] }), /capacity must be a positive finite number/)
+  assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], capacity: '10' }] }), /capacity must be a positive finite number/)
 })
 
 check('config: a malformed pool, route, or balance source fails the row', () => {
@@ -95,6 +146,92 @@ check('a balance script\'s output is read strictly', () => {
   assert.equal(parseBalanceOutput('{"remaining": "12"}').kind, 'invalid')
   assert.equal(parseBalanceOutput('{"balance": 12}').kind, 'invalid')
   assert.equal(parseBalanceOutput('{"remaining": null}').kind, 'invalid')
+})
+
+check('a reading carries the windows a script reported, and keeps the ones it can use', () => {
+  assert.deepEqual(parseBalanceOutput(JSON.stringify({
+    remaining: 2.94,
+    windows: [
+      { name: 'five-hour', remaining: 14, capacity: 14 },
+      { name: 'weekly', remaining: 2.94, capacity: 35 },
+      { name: 'monthly', remaining: 37.94 },
+    ],
+  })).reading, {
+    remaining: 2.94,
+    windows: [
+      { name: 'five-hour', remaining: 14, capacity: 14 },
+      { name: 'weekly', remaining: 2.94, capacity: 35 },
+      { name: 'monthly', remaining: 37.94 },
+    ],
+  })
+
+  const dropped = parseBalanceOutput(JSON.stringify({
+    remaining: 1,
+    windows: [
+      { name: '', remaining: 1, capacity: 1 },
+      { name: 'no-remaining', capacity: 1 },
+      { name: 'not-a-number', remaining: '5', capacity: 1 },
+      { name: 'zero-capacity', remaining: 1, capacity: 0 },
+      { name: 'kept', remaining: 1, capacity: 2 },
+      'not an object',
+    ],
+  })).reading
+  assert.deepEqual(dropped.windows, [
+    { name: 'zero-capacity', remaining: 1 },
+    { name: 'kept', remaining: 1, capacity: 2 },
+  ], 'a window nothing can be made of is dropped, and an unusable capacity is dropped with it')
+
+  assert.deepEqual(parseBalanceOutput('{"remaining": 5, "windows": "none"}').reading, { remaining: 5 })
+  assert.deepEqual(parseBalanceOutput('{"remaining": 5, "windows": []}').reading, { remaining: 5 })
+})
+
+check('a route is scored by its weighted worst window, or by its whole reading', () => {
+  const state = new RouteState(SCORED, () => 0)
+  state.noteReading('rich', {
+    remaining: 40,
+    windows: [
+      { name: 'five-hour', remaining: 8, capacity: 10 },
+      { name: 'monthly', remaining: 100, capacity: 100 },
+    ],
+  }, 0)
+  assert.equal(state.scoreOf('rich'), 0.5, 'the monthly window weighs half, so 1.0 × 0.5 is the worst')
+  state.noteReading('poor', { remaining: 3 }, 0)
+  assert.equal(state.scoreOf('poor'), 0.3, 'a reading with no window divides by the row capacity')
+  assert.equal(state.scoreOf('unread'), undefined, 'a provider nothing reported on has no score')
+  state.noteReading('rich', { remaining: 40, windows: [{ name: 'monthly', remaining: 100 }] }, 0)
+  assert.equal(state.scoreOf('rich'), undefined, 'a window without a capacity cannot be divided by')
+  state.noteReading('rich', { remaining: 40, windows: [{ name: 'five-hour', remaining: 40, capacity: 10 }] }, 0)
+  assert.equal(state.scoreOf('rich'), 1, 'more than a window\'s capacity is still full headroom')
+})
+
+check('the choice is proportional to headroom, and a scored route outranks an unread one', () => {
+  const { box, random } = fixedRandom(0)
+  const state = new RouteState(SCORED, random)
+  state.noteReading('rich', { remaining: 75, windows: [{ name: 'five-hour', remaining: 75, capacity: 100 }] }, 0)
+  state.noteReading('poor', { remaining: 2.5 }, 0)
+  assert.equal(state.scoreOf('rich'), 0.75)
+  assert.equal(state.scoreOf('poor'), 0.25)
+
+  box.value = 0
+  assert.equal(state.pick('medium', 0).provider, 'rich')
+  box.value = 0.74
+  assert.equal(state.pick('medium', 0).provider, 'rich', 'three quarters of the range is the richer route')
+  box.value = 0.75
+  assert.equal(state.pick('medium', 0).provider, 'poor', 'the rest of the range is the poorer one')
+  box.value = 0.999
+  assert.equal(state.pick('medium', 0).provider, 'poor', 'an unread route is never drawn while a scored one is usable')
+})
+
+check('with nothing scored the declared order decides, and every candidate carries equal weight', () => {
+  const state = new RouteState(SCORED, () => 0.99)
+  assert.deepEqual(state.pick('medium', 0), { provider: 'rich', model: 'r' },
+    'no reading in the pool: the declared order stands')
+  for (const provider of ['rich', 'poor']) {
+    state.noteReading(provider, { remaining: 0, windows: [{ name: 'monthly', remaining: 0, capacity: 100 }] }, 0)
+  }
+  assert.equal(state.scoreOf('rich'), 0)
+  assert.equal(state.pick('medium', 0).provider, 'poor',
+    'a zero total weight falls back to an equal chance over the scored routes')
 })
 
 check('fail-open: a route nothing reported on is usable, and declared order decides', () => {
@@ -216,15 +353,18 @@ check('an exhausted pool with no candidate leaves the session where it is', () =
   assert.equal(state.replacementFor('medium', { provider: 'third', model: 'three' }, now), undefined)
 })
 
-check('the report carries each route\'s reading and mark', () => {
+check('the report carries each route\'s reading, score, and mark', () => {
   const state = new RouteState(POLICY)
   state.noteReading('second', { remaining: 7, resetsAt: 'later' }, 1_000)
+  state.noteReading('third', { remaining: 7, windows: [{ name: 'weekly', remaining: 7, capacity: 70 }] }, 1_000)
   state.noteExhausted('third', 1_000)
   const report = state.report(1_000)
   assert.deepEqual(report.map(pool => pool.name), ['medium', 'shared', 'other'])
   const medium = report[0]
   assert.deepEqual(medium.routes.map(route => route.provider), ['first', 'second', 'third'])
   assert.deepEqual(medium.routes[1].reading, { remaining: 7, resetsAt: 'later', at: 1_000 })
+  assert.equal(medium.routes[1].score, undefined, 'a reading with nothing to divide by has no score')
+  assert.equal(medium.routes[2].score, 0.1, 'a route out of allowance still reports what it has left')
   assert.equal(medium.routes[2].exhaustedAt, 1_000)
   assert.equal(medium.routes[2].usable, false)
 })
