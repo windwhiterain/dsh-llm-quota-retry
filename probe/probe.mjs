@@ -282,11 +282,31 @@ check('config validation rejects unknown keys, invalid intervals, and non-boolea
   assert.throws(() => resolvePolicy({ defaultEnabled: 'yes' }), /defaultEnabled must be a boolean/)
   assert.throws(() => resolvePolicy({ quickRetries: 3 }), /unknown config key "quickRetries"/)
   assert.equal(DEFAULT_ENABLED, true, 'a session that owns no setting starts on')
-  assert.deepEqual(resolvePolicy({}), { longTermDelayMs: 3_600_000, defaultEnabled: true })
+  assert.deepEqual(resolvePolicy({}), {
+    longTermDelayMs: 3_600_000,
+    defaultEnabled: true,
+    nativeRetryFirstProviders: [],
+  })
   assert.deepEqual(resolvePolicy({ longTermDelayMs: 1000, defaultEnabled: false }), {
     longTermDelayMs: 1000,
     defaultEnabled: false,
+    nativeRetryFirstProviders: [],
   })
+})
+
+check('the native-first provider list takes harness provider ids, once each', () => {
+  assert.deepEqual(resolvePolicy({ nativeRetryFirstProviders: ['qwen', 'kimi'] }).nativeRetryFirstProviders, [
+    'qwen',
+    'kimi',
+  ])
+  assert.throws(() => resolvePolicy({ nativeRetryFirstProviders: 'qwen' }), /must be an array of provider ids/)
+  assert.throws(() => resolvePolicy({ nativeRetryFirstProviders: ['qwen', ''] }), /only non-empty provider ids/)
+  assert.throws(() => resolvePolicy({ nativeRetryFirstProviders: ['qwen', 'qwen'] }), /names provider "qwen" twice/)
+  assert.equal(
+    Object.isFrozen(resolvePolicy({ nativeRetryFirstProviders: ['qwen'] }).nativeRetryFirstProviders),
+    true,
+    'a deployment cannot add a provider to the list after activation',
+  )
 })
 
 check('only an exhausted allowance triggers long-term retry', () => {
@@ -986,6 +1006,136 @@ check('a failover records the route it moves to on the session', async () => {
     type: 'model/selection',
     data: { provider: 'second', model: 'two' },
   }], 'the model picker follows the retry')
+})
+
+/** A resolved normal-mode policy with the shortest waits these checks can time. */
+function nativePolicy(maxRetries) {
+  return {
+    mode: 'normal',
+    maxRetries,
+    retryableCodes: ['EMPTY_RESPONSE', 'QUOTA', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT'],
+    initialDelayMs: 20,
+    maxDelayMs: 40,
+    jitterRatio: 0,
+  }
+}
+
+/** One `llm/retry` event, as `@deepseek-ai/dsh-llm-retry` appends it. */
+function nativeRetryEvent(overrides) {
+  return {
+    type: 'llm/retry',
+    seq: 1,
+    time: Date.now(),
+    data: { turn: 1, step: 1, provider: 'probe-provider', ...overrides },
+  }
+}
+
+check('a named provider runs its own native schedule, then hands over to the hourly wait', async () => {
+  const context = createContext()
+  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  const policy = nativePolicy(2)
+
+  const first = Date.now()
+  assert.deepEqual(await dispatchFailure(context, { ...request, retryPolicy: policy }), { kind: 'retry' })
+  const firstWait = Date.now() - first
+  assert.ok(firstWait >= 20 && firstWait < 1_000, `the first attempt waits the policy's 20ms, waited ${firstWait}ms`)
+
+  const second = Date.now()
+  assert.deepEqual(await dispatchFailure(context, { ...request, retryPolicy: policy }), { kind: 'retry' })
+  const secondWait = Date.now() - second
+  assert.ok(secondWait >= 40 && secondWait < 1_000, `the second attempt doubles to 40ms, waited ${secondWait}ms`)
+
+  assert.equal(context.service.isRetrying(session), false, 'a quick retry is not a long-term entry')
+  assert.equal(enteredOf(context).length, 0)
+  assert.equal(
+    context.emitted.some(entry => entry.event === 'llm-quota-retry/failover'),
+    false,
+    'a throttled provider is not moved off',
+  )
+
+  const appendedBefore = appended.length
+  const exhausted = dispatchFailure(context, { ...request, retryPolicy: policy })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(enteredOf(context).length, 1, 'a spent quick budget opens the long-term entry instead')
+  assert.deepEqual(appended.slice(appendedBefore), [], 'nothing moved the session off its route')
+  await context.dispose()
+  assert.equal(await exhausted, undefined)
+})
+
+check('the quick budget is spent per step, not per session', async () => {
+  const context = createContext()
+  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  const policy = nativePolicy(1)
+  assert.deepEqual(await dispatchFailure(context, { ...request, retryPolicy: policy }), { kind: 'retry' })
+  const nextStep = await dispatchFailure(context, { ...request, retryPolicy: policy, step: 2 })
+  assert.deepEqual(nextStep, { kind: 'retry' }, 'the next step starts a fresh quick budget')
+  await context.dispose()
+})
+
+check('a provider the row does not name keeps the interval it had', async () => {
+  const context = createContext()
+  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  const started = Date.now()
+  const pending = dispatchFailure(context, { ...request, provider: 'other-provider', retryPolicy: nativePolicy(5) })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(enteredOf(context).length, 1, 'an unnamed provider answers its exhausted allowance with the interval')
+  assert.ok(Date.now() - started < 1_000, 'no quick wait stands in front of it')
+  await context.dispose()
+  assert.equal(await pending, undefined)
+})
+
+check('a provider with no bounded native schedule of its own answers with the interval', async () => {
+  const schedules = [undefined, { mode: 'always', initialDelayMs: 20, maxDelayMs: 40, jitterRatio: 0 }]
+  for (const retryPolicy of schedules) {
+    const context = createContext()
+    apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+    const started = Date.now()
+    const pending = dispatchFailure(context, { ...request, retryPolicy })
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const label = JSON.stringify(retryPolicy) ?? 'absent'
+    assert.equal(enteredOf(context).length, 1, `a schedule of ${label} has no budget to mirror`)
+    assert.ok(Date.now() - started < 1_000, `a schedule of ${label} waits no quick retry`)
+    await context.dispose()
+    assert.equal(await pending, undefined)
+  }
+})
+
+check('a provider-asked wait decides the quick retry, up to its own ceiling', async () => {
+  const within = createContext()
+  apply(within, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  const asked = { ...request, retryPolicy: nativePolicy(1), failure: { ...quotaFailure, providerRetryAfterMs: 30 } }
+  const started = Date.now()
+  assert.deepEqual(await dispatchFailure(within, asked), { kind: 'retry' })
+  assert.ok(Date.now() - started >= 30, 'the wait the provider asked for is the wait used')
+  await within.dispose()
+
+  const beyond = createContext()
+  apply(beyond, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  const tooLong = dispatchFailure(beyond, {
+    ...request,
+    retryPolicy: nativePolicy(5),
+    failure: { ...quotaFailure, providerRetryAfterMs: 600_000 },
+  })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(enteredOf(beyond).length, 1, 'a wait past the policy ceiling is the long-term wait')
+  await beyond.dispose()
+  assert.equal(await tooLong, undefined)
+})
+
+check('a native policy that already spent this step leaves the step to it', async () => {
+  const context = createContext()
+  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  dispatchSessionEvent(context, session, nativeRetryEvent({ retry: 7, maxRetries: 8, delayMs: 30_000 }))
+
+  const budgetLeft = await dispatchFailure(context, { ...request, retryPolicy: nativePolicy(8) })
+  assert.deepEqual(budgetLeft, { kind: 'retry' }, 'a native retry short of its budget has not spent one')
+
+  dispatchSessionEvent(context, session, nativeRetryEvent({ retry: 8, maxRetries: 8, delayMs: 30_000 }))
+  const pending = dispatchFailure(context, { ...request, retryPolicy: nativePolicy(8) })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(enteredOf(context).length, 1, 'the step the native policy spent is not retried again here')
+  await context.dispose()
+  assert.equal(await pending, undefined)
 })
 
 check('a pool named after a command word fails activation', () => {

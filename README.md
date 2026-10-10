@@ -65,6 +65,70 @@ declined it — which is exactly what "after the base quick retries" means. The
 bundle's own `cordis.patch.yml` appends the row to the composition root, so a
 bundle install lands in the right place automatically.
 
+**Row order does not decide listener order.** A Cordis waterfall runs its
+listeners in registration order, and a plugin registers when its services
+appear rather than when its row is read; reloading a row moves that row's
+listener to the end. So in a deployment where this plugin happened to activate
+first, it gets the first word on a quota failure, and a failure the native
+policy lists as eligible gets no native retry at all. A provider named in
+[`nativeRetryFirstProviders`](#native-quick-retries-for-a-named-provider) is
+answered the same way either way.
+
+## Native quick retries for a named provider
+
+Some providers report ordinary request throttling as a spent allowance — a
+`QUOTA` body behind a 429 that clears in seconds. Waiting out an hour for that
+is the failure this plugin exists to avoid, and on those providers a rate limit
+must also not count as evidence that the account is out of allowance.
+
+`nativeRetryFirstProviders` names them. For a named provider, an exhausted
+allowance runs that provider's **own native retry schedule first** — the same
+bounded exponential backoff and the same attempt budget `@deepseek-ai/dsh-llm-retry`
+would have run, taken from the resolved `retryPolicy` the failed request carries
+(`initialDelayMs`, `maxDelayMs`, `jitterRatio`, `maxRetries`, and a
+`providerRetryAfterMs` the provider asked for while it fits under its own
+ceiling). Only when that budget is spent does this plugin mark the provider out
+of allowance, move the session to another route of its pool, and start the
+hourly wait.
+
+The quick retries run **before** the exhaustion mark and before any failover, so
+a provider that was merely throttled keeps its allowance and the session stays
+on it. They hold the open step for a few seconds, like the long-term wait does,
+and they announce nothing: the entry, its events, and `ctx.llmQuotaRetry` state
+describe the long-term wait, which has not started yet. Progress is in the log:
+
+```
+llm-quota-retry: provider "qwen" returned QUOTA; native quick retry 2 in 4000ms
+```
+
+Three rules decide whether a quick retry happens at all, and each is a case
+where the native policy, not this plugin, owns the step:
+
+- **The provider is named in the row.** Every other provider is unchanged.
+- **The native policy holds a bounded schedule.** No `retryPolicy` at all, and
+  `mode: always`, which has no budget to spend, leave the failure to the hourly
+  wait. So does a `providerRetryAfterMs` beyond the policy's `maxDelayMs`, which
+  the native policy answers by delegating rather than by retrying.
+- **The native policy has not already spent this step's budget.** When this row
+  really does run after `dsh-llm-retry` and the failure is one that policy
+  retries, its own budget is spent first, and this plugin adds no wait of its
+  own. The plugin reads that from the `llm/retry` events the Session already
+  records — the one piece of cross-plugin state it depends on, and one it can
+  simply lack: without `@deepseek-ai/dsh-llm-retry` the quick schedule runs, and
+  with a native policy that never spent its budget, so does it.
+
+The quick budget is counted per step, like the native one: a step that runs out
+of it enters the long-term wait, and the next step starts a fresh budget.
+
+```yaml
+- id: llm-quota-retry
+  name: 'dsh-llm-quota-retry'
+  config:
+    # qwen reports a 429 rate limit as `insufficient_quota`, so its own bounded
+    # backoff runs first: 2s, 4s, 8s … up to maxRetries, then the hourly wait.
+    nativeRetryFirstProviders: [qwen]
+```
+
 ## What this plugin does not touch
 
 The plugin is strictly additive for every failure except an exhausted
@@ -92,7 +156,10 @@ allowance, and for that too in every session whose switch is off:
   not in the default `retryableCodes`, so by default an exhausted allowance
   triggers no native retry at all and this plugin is the only thing that
   answers it; a provider that lists `QUOTA` (or runs `mode: always`) keeps its
-  own retries, and this plugin wakes up only after they are spent.
+  own retries, and this plugin wakes up only after they are spent. A provider
+  named in `nativeRetryFirstProviders` runs that same schedule from here when
+  the native policy did not, which is additive rather than a replacement: see
+  [the named provider](#native-quick-retries-for-a-named-provider).
 - **One configuration is superseded rather than merely left alone.**
   `retryPolicy.mode: always` has no eligible-code list and no budget, and it
   asks downstream first, so for an exhausted allowance the hourly schedule
@@ -164,6 +231,7 @@ use it.
 |---|---|---|
 | `longTermDelayMs` | `3600000` | Interval between long-term attempts, in milliseconds. Must be a positive finite number no greater than `2147483647`. |
 | `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes the whole allowance response opt-in. |
+| `nativeRetryFirstProviders` | none | Provider ids whose exhausted allowance runs the provider's own native retry schedule first. See [the named provider](#native-quick-retries-for-a-named-provider). |
 | `pools` | none | Named, ordered route lists a session may be moved between. See below. |
 | `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with. See below. |
 | `failOpen` | `true` | Whether a route nothing reported on counts as usable. `false` makes an unread provider unusable, so only a route a script vouches for is ever chosen. |
@@ -510,6 +578,16 @@ export function apply(ctx) {
   counts; an `AUTH` or `RATE_LIMIT` failure counts only when its text names a
   spent usage limit, quota, balance, or credits, in English or Chinese.
   Everything else reaches the next listener untouched.
+- **A quick retry of a named provider is a billed request too**, and it is
+  bounded exactly like the native one: at most `maxRetries` waits per step,
+  none longer than the policy's `maxDelayMs`. It is what runs first for a
+  provider in `nativeRetryFirstProviders`, and it is the reason such a provider
+  is neither marked out of allowance nor moved off while its limit lasts.
+- **Quick retries publish nothing.** They emit no plugin event and append no
+  session event: `llm/retry` belongs to `@deepseek-ai/dsh-llm-retry` and
+  counting these waits into its projection state would make *it* skip retries
+  it still owes. The entry, `ctx.llmQuotaRetry`, and the three events describe
+  the long-term wait, which starts after the quick budget is spent.
 - **A failover is a billed request on the other route, and it happens at once.**
   The failed request itself already cost what it cost; the retry on the pool's
   next usable route is one more request, which is the point of configuring a
@@ -594,7 +672,9 @@ that is moved off an exhausted provider, the immediate retry a pool with
 allowance produces, the long-term wait a pool without one still uses, the switch
 that stops both, the pool setting (stated, inferred, opted out, inherited, and
 restored from storage), the `model/selection` event a chosen route is recorded
-as, and the balance scripts, seen through a fake subprocess service:
+as, the balance scripts seen through a fake subprocess service, and the
+native-first provider list: which providers qualify, the waits it schedules, and
+the long-term entry it hands over to once that budget is spent.
 
 ```sh
 node probe/probe.mjs

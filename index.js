@@ -12,6 +12,15 @@
  * normal-mode retries for eligible codes run first, delegating here only once
  * its budget is spent.
  *
+ * Which listener of that extension point runs first is not something a row
+ * order decides — plugins register as their services appear, and a reload moves
+ * a listener to the end — so a provider named in `nativeRetryFirstProviders`
+ * does not depend on it. Such a provider meters ordinary throttling as a spent
+ * allowance, and this plugin then runs that provider's own native schedule
+ * itself: the same bounded exponential backoff, the same attempt budget, taken
+ * from the resolved policy the failed request carries, and only when the native
+ * policy has not already spent this step's budget on its own.
+ *
  * Long-term retry is per Session and on by default, so an exhausted allowance
  * is waited out without a per-Session opt-in. The switch is durable
  * (`llm_quota_retry` storage domain), written through `/quota-retry`, and
@@ -60,6 +69,7 @@ import {
   effectiveEnabled,
   isExhaustedAllowanceFailure,
   isSuccessfulResponse,
+  nativeQuickDelayMs,
   normalizeSettingRecord,
   ownedSettingOf,
   parsePoolCommand,
@@ -107,12 +117,14 @@ const PASSTHROUGH_SCHEMA = { parse: value => value }
  * @param ctx - plugin context that owns the listeners, the published service,
  *   the durable settings, and the active waits.
  * @param config - row config: `longTermDelayMs` sets the interval between
- *   attempts, `defaultEnabled` sets the switch a Session starts from, `balances`
- *   describes how to read each provider's remaining allowance, and `pools` names
- *   the ordered route lists a Session may be moved between. `failOpen` decides
- *   what a route nothing reported on means, and `exhaustedCooldownMs` how long a
- *   provider stays marked after it reported exhaustion. Unknown keys and invalid
- *   values throw at activation.
+ *   attempts, `defaultEnabled` sets the switch a Session starts from,
+ *   `nativeRetryFirstProviders` names the providers whose exhausted allowance
+ *   runs the native retry schedule first, `balances` describes how to read each
+ *   provider's remaining allowance, and `pools` names the ordered route lists a
+ *   Session may be moved between. `failOpen` decides what a route nothing
+ *   reported on means, and `exhaustedCooldownMs` how long a provider stays
+ *   marked after it reported exhaustion. Unknown keys and invalid values throw
+ *   at activation.
  */
 export function apply(ctx, config = {}) {
   const policy = resolvePolicy(config, ROUTE_CONFIG_KEYS)
@@ -166,6 +178,8 @@ export function apply(ctx, config = {}) {
   const records = new Map()
   /** Session projection state -> its client value, for a stable wire reference. */
   const views = new Map()
+  /** Session -> the step whose native retry budget `@deepseek-ai/dsh-llm-retry` spent. */
+  const nativeSpent = new WeakMap()
   let domain = null
   /** Settles once the storage domain is open or has failed; null while unavailable. */
   let storageOpening = null
@@ -376,7 +390,14 @@ export function apply(ctx, config = {}) {
 
   // Model-request success is the only evidence that the account's quota is
   // usable again, so it is the only automatic transition that ends an entry.
+  // A native retry is read here as well, because it is the only evidence of
+  // whether the provider's own policy already spent this step's retries — the
+  // one case in which this plugin must not spend another wait of its own.
   const disposeSuccessListener = ctx.on('session/event', (session, event) => {
+    if (event.type === 'llm/retry') {
+      noteNativeRetry(session, event.data)
+      return
+    }
     if (!ledger.isRetrying(session) || !isSuccessfulResponse(event)) return
     endEntry(session, 'recovered')
   })
@@ -449,10 +470,83 @@ export function apply(ctx, config = {}) {
     return route === undefined ? undefined : { pool: poolName, route }
   }
 
-  async function recover({ agent, turn, step, provider, failure, signal }) {
+  /**
+   * Remember that the provider's own retry policy spent its whole budget on one
+   * step. An unbounded `always` policy declares no `maxRetries`, so only the
+   * last retry of a bounded one proves a budget is gone.
+   *
+   * @param session - the Session the retry ran for.
+   * @param data - one `llm/retry` event's data.
+   */
+  function noteNativeRetry(session, data) {
+    if (data.maxRetries === undefined || data.retry < data.maxRetries) return
+    nativeSpent.set(session, { turn: data.turn, step: data.step, provider: data.provider })
+  }
+
+  /**
+   * Whether the native retry policy already spent this step's budget on this
+   * provider, which is what happens when this row is composed after
+   * `@deepseek-ai/dsh-llm-retry` and that policy lists the failure as eligible.
+   * @param session - the Session making the request.
+   * @param turn - the failing request's turn.
+   * @param step - the failing request's step.
+   * @param provider - the failing request's provider.
+   * @returns true when no quick wait of this plugin's own is left to spend.
+   */
+  function nativeBudgetSpent(session, turn, step, provider) {
+    const spent = nativeSpent.get(session)
+    return spent !== undefined
+      && spent.turn === turn && spent.step === step && spent.provider === provider
+  }
+
+  /**
+   * The short native-style wait one failed request deserves before this plugin
+   * treats it as an outage, or undefined when the native policy owns it.
+   *
+   * Only a provider the row names is eligible, and only while its own policy
+   * holds a bounded schedule this plugin can mirror: no policy and unbounded
+   * `always` mode leave the failure to this plugin's hourly wait, and a budget
+   * the native policy already spent leaves the step to it.
+   *
+   * @param session - the Session whose request failed.
+   * @param request - the failing request's turn, step, provider, failure, and
+   *   resolved retry policy.
+   * @returns the attempt and its wait, or undefined when none applies.
+   */
+  function quickRetryFor(session, { turn, step, provider, failure, retryPolicy }) {
+    if (!policy.nativeRetryFirstProviders.includes(provider)) return undefined
+    if (nativeBudgetSpent(session, turn, step, provider)) return undefined
+    const maxAttempts = retryPolicy?.mode === 'normal' ? retryPolicy.maxRetries : 0
+    return ledger.quickAttempt(
+      session,
+      turn,
+      step,
+      maxAttempts,
+      attempt => nativeQuickDelayMs(retryPolicy, failure, attempt),
+    )
+  }
+
+  async function recover({ agent, turn, step, provider, failure, retryPolicy, signal }) {
     const session = agent.session
     if (signal.aborted) return
     if (!enabledForSession(session)) return
+    // A provider the row names meters its own rate limit as a spent allowance,
+    // so its own short schedule runs first: waiting out an hour for a limit that
+    // clears in seconds is the failure this answers, and a provider that is only
+    // throttled must not be marked out of allowance or moved off either.
+    const quick = quickRetryFor(session, { turn, step, provider, failure, retryPolicy })
+    if (quick !== undefined) {
+      ctx.logger.info(
+        `llm-quota-retry: provider "${provider}" returned ${failure.code}; `
+        + `native quick retry ${quick.attempt} in ${Math.round(quick.delayMs)}ms`,
+      )
+      const elapsed = await cancellableDelay(
+        quick.delayMs,
+        AbortSignal.any([signal, lifetime.signal]),
+      )
+      if (!elapsed) return
+      return { kind: 'retry' }
+    }
     const now = Date.now()
     // The provider itself just reported that it has nothing left. That is a
     // stronger fact than any reading, so it decides before a probe does, and the
