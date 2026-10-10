@@ -234,7 +234,7 @@ use it.
 | `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes the whole allowance response opt-in. |
 | `nativeRetryFirstProviders` | none | Provider ids whose exhausted allowance runs the provider's own native retry schedule first. See [the named provider](#native-quick-retries-for-a-named-provider). |
 | `pools` | none | Named, ordered route lists a session may be moved between. See below. |
-| `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with, the `coefficients` weighing each window it reports, and the `capacity` a reading with no window divides by. See below. |
+| `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with, the `coefficients` weighing each window it reports, the `capacities` a window the script leaves without one divides by, and the `capacity` a reading with no window divides by. See below. |
 | `failOpen` | `true` | Whether a route nothing reported on counts as usable. `false` makes an unread provider unusable, so only a route a script vouches for is ever chosen. |
 | `exhaustedCooldownMs` | `3600000` | How long a provider stays marked after a request failed with an exhausted allowance. Must be a positive finite number no greater than `2147483647`. |
 
@@ -280,6 +280,8 @@ provider, no dependencies, each printing one JSON reading on stdout.
         coefficients:             # how the windows this script reports are weighed
           five-hour: 1            # a window the map does not name weighs 1
           monthly: 0.25           # a month of credits matters a quarter as much
+        capacities:               # what a window counts as full, for a script that
+          monthly: 40             # reports an amount without the plan's cap
       - provider: gateway-b
         script: ['node', 'C:/resource/dsh-balance/gateway-b.mjs']
         apiKeyEnv: GATEWAY_B_API_KEY
@@ -423,7 +425,7 @@ whichever route the draw lands on rather than to the one with the most left.
 
 | Case | What decides |
 |---|---|
-| The row names one or more scored windows | The lowest `remaining / capacity × coefficient` over the windows that carry a `capacity` |
+| The row names one or more scored windows | The lowest `remaining / capacity × coefficient` over the windows that carry a `capacity`, or a `capacities` entry for their name |
 | The reading has no scorable window | The whole reading against the row's `capacity`, when the row declares one |
 | Neither | The route is unscored, and undrawable while any scored route of the pool is usable |
 | Nothing in the pool is scored | Declared order: the first usable route, exactly as before |
@@ -439,6 +441,14 @@ means a month of credits counts for a quarter of what the same fraction of a
 five-hour cap counts for; `0` drops a window from the score entirely. A window
 name the map does not mention weighs `1`, so a row that declares no
 `coefficients` weighs every window equally.
+
+`capacities` is the other half: a provider that reports **what is left of a
+window without stating what full is** — an endpoint that answers a dollar amount
+of remaining credits and no monthly cap — leaves that window unscored until the
+row says what the window's full allowance is. The capacity the script reports
+always wins; the row's entry only fills in a window the provider left without
+one. `--raw` on the balance script, or `/quota-routes`, shows which windows came
+back and which of them are being scored.
 
 **Leaving a route** needs one thing: the provider itself reporting the allowance
 spent. A reading below the threshold does not move a session that has already

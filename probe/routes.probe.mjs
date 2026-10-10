@@ -89,15 +89,23 @@ check('config: pools and balance sources resolve, with their defaults', () => {
     minimumOf: {},
     refreshOf: {},
     coefficientOf: {},
+    windowCapacityOf: {},
     capacityOf: {},
   })
 })
 
-check('config: window coefficients and a whole-reading capacity resolve, or fail the row', () => {
+check('config: window coefficients and capacities resolve, or fail the row', () => {
   const routes = resolveRoutes({
-    balances: [{ provider: 'p', script: ['s'], coefficients: { 'five-hour': 2, monthly: 0 }, capacity: 10 }],
+    balances: [{
+      provider: 'p',
+      script: ['s'],
+      coefficients: { 'five-hour': 2, monthly: 0 },
+      capacities: { monthly: 40 },
+      capacity: 10,
+    }],
   })
   assert.deepEqual(routes.coefficientOf.p, { 'five-hour': 2, monthly: 0 })
+  assert.deepEqual(routes.windowCapacityOf.p, { monthly: 40 })
   assert.equal(routes.capacityOf.p, 10)
   assert.equal(routes.capacityOf.q, undefined, 'a provider without a capacity has none to divide by')
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], coefficients: 1 }] }), /coefficients must be an object/)
@@ -105,6 +113,8 @@ check('config: window coefficients and a whole-reading capacity resolve, or fail
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], coefficients: { '': 1 } }] }), /must not name an empty window/)
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], capacity: 0 }] }), /capacity must be a positive finite number/)
   assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], capacity: '10' }] }), /capacity must be a positive finite number/)
+  assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], capacities: [] }] }), /capacities must be an object/)
+  assert.throws(() => resolveRoutes({ balances: [{ provider: 'p', script: ['s'], capacities: { monthly: 0 } }] }), /capacities\.monthly must be a positive finite number/)
 })
 
 check('config: a malformed pool, route, or balance source fails the row', () => {
@@ -202,6 +212,22 @@ check('a route is scored by its weighted worst window, or by its whole reading',
   assert.equal(state.scoreOf('rich'), undefined, 'a window without a capacity cannot be divided by')
   state.noteReading('rich', { remaining: 40, windows: [{ name: 'five-hour', remaining: 40, capacity: 10 }] }, 0)
   assert.equal(state.scoreOf('rich'), 1, 'more than a window\'s capacity is still full headroom')
+})
+
+check('a window the provider states no capacity for divides by the row\'s own', () => {
+  const state = new RouteState(resolveRoutes({
+    pools: { medium: { routes: [{ provider: 'goat', model: 'g' }] } },
+    balances: [{ provider: 'goat', script: ['s'], capacities: { monthly: 40 } }],
+  }), () => 0)
+  state.noteReading('goat', {
+    remaining: 0.91,
+    windows: [
+      { name: 'monthly', remaining: 0.91 },
+      { name: 'weekly', remaining: 35, capacity: 35 },
+    ],
+  }, 0)
+  assert.equal(state.scoreOf('goat'), 0.02275,
+    'a reported capacity wins, and the row fills in the window the endpoint states none for')
 })
 
 check('the choice is proportional to headroom, and a scored route outranks an unread one', () => {
