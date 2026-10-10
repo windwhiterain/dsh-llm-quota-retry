@@ -522,7 +522,9 @@ and a change of behavior the conversation did not ask for.
   anyone choosing between them.
 
 `/quota-routes [pool]` prints the same state a person needs: each pool, each
-route, its last reading, its score when it has one, and its exhaustion mark.
+route, its last reading, its score when it has one, and its exhaustion mark. A
+pool that refuses mid-session switching is named as such in its header, so the
+report also answers why a session did not move.
 
 ### Pool names
 

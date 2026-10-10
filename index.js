@@ -733,7 +733,8 @@ export function apply(ctx, config = {}, internals = {}) {
         return `  ${route.usable ? 'ok ' : 'no '} ${route.provider}/${route.model} — ${balance}`
           + `${describeScore(route.score)}${mark}`
       })
-      return `pool "${pool.name}":\n${lines.join('\n')}`
+      return `pool "${pool.name}"${pool.midSessionSwitch ? '' : ' (refuses mid-session switching)'}:`
+        + `\n${lines.join('\n')}`
     }))
     return blocks.join('\n')
   }

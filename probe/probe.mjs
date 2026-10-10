@@ -798,6 +798,10 @@ check('/quota-routes reports pools, readings, and exhaustion marks', async () =>
     pools: {
       medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] },
       empty: { routes: [{ provider: 'third', model: 'three' }] },
+      held: {
+        midSessionSwitch: false,
+        routes: [{ provider: 'fourth', model: 'four' }],
+      },
     },
     balances: [{ provider: 'first', script: ['probe-script'], minimumRemaining: 1, unit: 'percent' }],
   })
@@ -809,10 +813,15 @@ check('/quota-routes reports pools, readings, and exhaustion marks', async () =>
   assert.match(text, /no\s+first\/one — 4, resets 2026-01-01T00:00:00.000Z \[exhausted /)
   assert.match(text, /ok\s+second\/two — no reading/)
   assert.match(text, /pool "empty"/)
+  assert.match(text, /pool "held" \(refuses mid-session switching\):/,
+    'the report says why a pool never moves a Session by itself')
   const narrowed = (await context.commands.runNamed('quota-routes', 'empty')).text
   assert.match(narrowed, /pool "empty"/)
   assert.equal(/pool "medium"/.test(narrowed), false)
-  assert.match((await context.commands.runNamed('quota-routes', 'nope')).text, /no pool named "nope"; configured pools: medium, empty/)
+  assert.match(
+    (await context.commands.runNamed('quota-routes', 'nope')).text,
+    /no pool named "nope"; configured pools: medium, empty, held/,
+  )
 })
 
 check('the published service keeps its retry surface and adds the route surface', async () => {
