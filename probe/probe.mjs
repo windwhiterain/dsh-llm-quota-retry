@@ -681,7 +681,7 @@ check('a pooled session moves to a route with allowance and retries at once', as
     'the next request of that session is proposed on the replacement route')
 })
 
-check('a reading below the threshold leaves an open session where it is', async () => {
+check('a reading below the threshold leaves a running session where it is', async () => {
   const scripts = createSubprocess(['{"remaining": 0}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
@@ -694,10 +694,13 @@ check('a reading below the threshold leaves an open session where it is', async 
     { provider: 'second', model: 'two' },
     'a session that has not started avoids the route below its threshold',
   )
+  // A model no pool holds is what a session starts on before it is moved onto one,
+  // so its next request is the one that has to be left alone.
+  await dispatchRequest(context, agent, { provider: 'elsewhere', model: 'elsewhere' })
   assert.deepEqual(
     await dispatchRequest(context, agent, { provider: 'first', model: 'one' }),
     { provider: 'first', model: 'one' },
-    'the session already on it is not interrupted for a threshold',
+    'a session already running on it is not interrupted for a threshold',
   )
 })
 
@@ -938,19 +941,25 @@ check('a failover draws from the scored routes, and an unread one is only a fall
   }
 
   /**
-   * Read the pool, then fail the first route and answer where the retry went.
-   * @param draw - the sample the proportional choice is given.
+   * Start a session on the pool's own draw, then fail the route it started on and
+   * answer where the retry went.
+   * @param startDraw - the sample the starting draw is given.
+   * @param draw - the sample the failover draw is given.
    * @param readings - one script output per balance row, in declared order.
    * @param balances - the balance rows of this scenario.
    * @returns the provider the failed request was moved to.
    */
-  async function failoverFrom(draw, readings, balances) {
+  async function failoverFrom(startDraw, draw, readings, balances) {
     const context = createContext({ subprocess: createSubprocess([...readings]) })
-    apply(context, { longTermDelayMs: 60_000, pools: { medium }, balances }, { random: () => draw })
+    let sample = startDraw
+    apply(context, { longTermDelayMs: 60_000, pools: { medium }, balances }, { random: () => sample })
     await context.service.pickRoute('medium')
-    await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+    // The first request is the starting draw, so the session is already running on
+    // the route the failover below has to leave.
+    const started = await dispatchRequest(context, agent, { provider: 'first', model: 'one' })
+    sample = draw
     const before = context.emitted.length
-    assert.deepEqual(await dispatchFailure(context, { ...request, provider: 'first' }), { kind: 'retry' })
+    assert.deepEqual(await dispatchFailure(context, { ...request, provider: started.provider }), { kind: 'retry' })
     const moved = context.emitted.slice(before).find(entry => entry.event === 'llm-quota-retry/failover')
     assert.ok(moved !== undefined, 'the failed request moved to another route of its pool')
     return moved.payload.to.provider
@@ -966,13 +975,14 @@ check('a failover draws from the scored routes, and an unread one is only a fall
     { provider: 'second', script: ['probe-script'] },
     { provider: 'third', script: ['probe-script'] },
   ]
-  assert.equal(await failoverFrom(0.99, readings, balances), 'third',
+  assert.equal(await failoverFrom(0, 0.99, readings, balances), 'third',
     'the two weights left add up to the whole range, and the smaller one holds its end')
-  assert.equal(await failoverFrom(0.5, readings, balances), 'second',
+  assert.equal(await failoverFrom(0, 0.5, readings, balances), 'second',
     'half of the range is the route with half the headroom of the one above it')
 
   assert.equal(
     await failoverFrom(
+      0,
       0.999,
       [readings[0]],
       [{ provider: 'first', script: ['probe-script'] }],
@@ -996,7 +1006,7 @@ check('a pool that refuses mid-session switching waits where the session is', as
   assert.deepEqual(await dispatchRequest(context, agent, { provider: 'first', model: 'one' }), {
     provider: 'first',
     model: 'one',
-  }, 'the route a session starts on is still the pool\'s to choose')
+  }, 'with nothing scored, the pool\'s declared order answers the session\'s start')
   const pending = dispatchFailure(context, { ...request, provider: 'first' })
   await new Promise(resolve => setTimeout(resolve, 10))
   assert.equal(
@@ -1007,6 +1017,87 @@ check('a pool that refuses mid-session switching waits where the session is', as
   assert.equal(enteredOf(context).length, 1, 'the exhausted allowance is waited out where it is')
   await context.dispose()
   assert.equal(await pending, undefined)
+})
+
+check('a session that has not started is drawn from its pool by headroom', async () => {
+  const scripts = createSubprocess(['{"remaining": 20}', '{"remaining": 80}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: { medium: { routes: [{ provider: 'rich', model: 'r' }, { provider: 'poor', model: 'p' }] } },
+    balances: [
+      { provider: 'rich', script: ['probe-script'], capacity: 100 },
+      { provider: 'poor', script: ['probe-script'], capacity: 100 },
+    ],
+  }, { random: () => 0.9 })
+  await context.service.pickRoute('medium')
+  assert.deepEqual(
+    await dispatchRequest(context, agent, { provider: 'rich', model: 'r' }),
+    { provider: 'poor', model: 'p' },
+    'the route a session starts on is drawn from the pool, not taken from the model it was created with',
+  )
+  assert.deepEqual(
+    await dispatchRequest(context, agent, { provider: 'poor', model: 'p' }),
+    { provider: 'poor', model: 'p' },
+    'a session that has started keeps its route while that provider still has allowance',
+  )
+  await context.dispose()
+})
+
+check('a pool that refuses mid-session switching still starts a session by headroom', async () => {
+  const scripts = createSubprocess(['{"remaining": 80}', '{"remaining": 20}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: {
+      held: {
+        midSessionSwitch: false,
+        routes: [{ provider: 'rich', model: 'r' }, { provider: 'poor', model: 'p' }],
+      },
+    },
+    balances: [
+      { provider: 'rich', script: ['probe-script'], capacity: 100 },
+      { provider: 'poor', script: ['probe-script'], capacity: 100 },
+    ],
+  }, { random: () => 0.9 })
+  await context.service.pickRoute('held')
+  const started = await dispatchRequest(context, agent, { provider: 'rich', model: 'r' })
+  assert.deepEqual(started, { provider: 'poor', model: 'p' },
+    'choosing the route a session starts on is not a mid-session switch')
+  const pending = dispatchFailure(context, { ...request, provider: 'poor' })
+  await new Promise(resolve => setTimeout(resolve, 10))
+  assert.equal(
+    context.emitted.some(entry => entry.event === 'llm-quota-retry/failover'),
+    false,
+    'and the pool still refuses to move it once it is running',
+  )
+  await context.dispose()
+  assert.equal(await pending, undefined)
+})
+
+check('a starting session reads its pool in the background', async () => {
+  const scripts = createSubprocess(['{"remaining": 5}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: {
+      medium: { routes: [{ provider: 'inside', model: 'i' }] },
+      other: { routes: [{ provider: 'outside', model: 'o' }] },
+    },
+    balances: [
+      { provider: 'inside', script: ['probe-script'] },
+      { provider: 'outside', script: ['probe-script'] },
+    ],
+  })
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'inside', model: 'i' }), {
+    provider: 'inside',
+    model: 'i',
+  }, 'nothing is scored yet, so the declared order answers')
+  await settled()
+  assert.equal(scripts.spawned.length, 1, 'the pool the session started in is read for the next start')
+  assert.equal(context.service.report().find(pool => pool.name === 'other').routes[0].reading, undefined,
+    'and no provider outside that pool is probed')
+  await context.dispose()
 })
 
 check('a pool that refuses mid-session switching still moves a session the user puts in it', async () => {

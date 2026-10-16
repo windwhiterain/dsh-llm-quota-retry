@@ -22,7 +22,8 @@ report exhaustion themselves.
 Any session can also be put in a pool by hand — the
 [second composer chip or `/quota-pool`](#the-per-session-route-pool) — and a
 session whose model happens to be pooled follows that pool without being told to.
-A pool's `minimumRemaining` decides which route a session *starts* on; once a
+A pool's `minimumRemaining` decides which routes a session *starts* on, and the
+one it starts on is drawn from them in proportion to what each has left; once a
 session is running, only a provider reporting its allowance spent moves it.
 
 That covers three shapes of the same condition: the canonical `QUOTA` code, and
@@ -243,7 +244,7 @@ use it.
 | `longTermDelayMs` | `3600000` | Interval between long-term attempts, in milliseconds. Must be a positive finite number no greater than `2147483647`. |
 | `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes the whole allowance response opt-in. |
 | `nativeRetryFirstProviders` | none | Provider ids whose exhausted allowance runs the provider's own native retry schedule first. See [the named provider](#native-quick-retries-for-a-named-provider). |
-| `pools` | none | Named, ordered route lists a session may be moved between. Each pool is `routes` plus, optionally, `midSessionSwitch: false` to refuse the moves this plugin makes on its own. See below. |
+| `pools` | none | Named, ordered route lists a session starts on and may be moved between. Each pool is `routes` plus, optionally, `midSessionSwitch: false` to refuse the moves this plugin makes on its own once a session is running. See below. |
 | `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with, the `coefficients` weighing each window it reports, the `capacities` a window the script leaves without one divides by, and the `capacity` a reading with no window divides by. See below. |
 | `failOpen` | `true` | Whether a route nothing reported on counts as usable. `false` makes an unread provider unusable, so only a route a script vouches for is ever chosen. |
 | `exhaustedCooldownMs` | `3600000` | How long a provider stays marked after a request failed with an exhausted allowance. Must be a positive finite number no greater than `2147483647`. |
@@ -417,6 +418,13 @@ That split is deliberate: another account can mean another model, another prompt
 cache, and another price, so a live conversation is only moved when the route it
 is on cannot answer at all.
 
+**A session's first request is where the pool chooses.** A session that has not
+made a request through this plugin yet has no conversation to protect, so its
+starting route is drawn from its pool by the rule below, whatever
+`midSessionSwitch` says. That is also when the pool's own providers are read in the
+background, so the readings the *next* session starts on are current; the request
+itself is never held behind a script.
+
 **Choosing a route**, in this order:
 
 1. **An exhaustion mark decides first.** A provider that answered a request with
@@ -477,13 +485,14 @@ routes are interchangeable for the session that *starts* on one, never for the
 session already running on it: an exhausted provider is waited out where it is
 instead of being swapped for a different model mid-conversation, and no
 `llm-quota-retry/failover` is announced. It governs **only the moves this plugin
-makes on its own** — the failure-time failover and the per-request replacement.
-A move the user asks for is not that decision and is unaffected: the model
-picker, `/quota-pool <name>`, and the composer chip all still move a session,
-and `pickRoute` still draws a starting route for every new session and every
-delegated child. Use it for a pool whose routes are different *models* rather
-than the same model behind several accounts, where the swap costs a prompt cache
-and a change of behavior the conversation did not ask for.
+makes on its own after that start** — the failure-time failover and the
+per-request replacement. A move the user asks for is not that decision and is
+unaffected: the model picker, `/quota-pool <name>`, and the composer chip all still
+move a session, and `pickRoute` still draws a starting route for every new session
+and every delegated child. Use it for a pool whose routes are different *models*
+rather than the same model behind several accounts, where the swap costs a prompt
+cache and a change of behavior the conversation did not ask for — the sessions
+still *start* on whichever of those models has the most left.
 
 | Pool | `midSessionSwitch` | What a session already running on one of its routes does when that provider runs out |
 |---|---|---|
@@ -498,14 +507,17 @@ and a change of behavior the conversation did not ask for.
   `llm-quota-retry/failover`; none found means the long-term wait, exactly as
   before. A pool that refuses mid-session switching is one of the ways none is
   found.
-- **At every request**, the route the session would otherwise use is replaced
-  when its provider has **reported the allowance spent**, and the pool holds a
-  route that has not. This decision reads cached readings and marks only — it
-  starts no script and waits for nothing, because a model request must never be
-  held behind a balance probe. A reading below a route's threshold does not move
-  an open session (see "How a route is chosen"), a pool that refuses mid-session
-  switching never moves it here either, and a route the user picked in
-  the model picker is left alone as soon as it falls outside the session's pool.
+- **At every request**, the route the session would otherwise use is drawn from its
+  pool in proportion to headroom while the session is still starting, and replaced
+  once it has started when its provider has **reported the allowance spent** and the
+  pool holds a route that has not. This decision reads cached readings and marks
+  only — it starts no script the request waits for and waits for nothing, because a
+  model request must never be held behind a balance probe; a session that starts
+  refreshes its pool's readings in the background for the next one. A reading below
+  a route's threshold does not move a session that has already started (see "How a
+  route is chosen"), a pool that refuses mid-session switching never moves it here
+  either, and a route the user picked in the model picker is left alone as soon as it
+  falls outside the session's pool.
 - **Which pool governs a session**: the one the session states (`/quota-pool`,
   the chip, or the delegation plugin that created it), or — when it states none —
   the single pool that holds the route the session is on. A route two pools share
@@ -711,9 +723,10 @@ export function apply(ctx) {
   later), so a script with its own cache cannot bounce a session straight back
   into the route that just refused it.
 - **Route state is in-memory, the settings are not.** Readings, marks, and the
-  route each session is on are lost when the host restarts or the row reloads;
-  the next requests re-derive them from the providers' own answers and the next
-  script runs. The switch **and the route pool** are durable, in the same
+  route each session is on are lost when the host restarts or the row reloads, so
+  the first request after one reads as that session's start and is drawn from its
+  pool again — a pool that refuses mid-session switching included. The switch **and
+  the route pool** are durable, in the same
   `llm_quota_retry` record with the same inheritance.
 - **Cancelling a turn keeps the entry.** The pending wait aborts, `pending`
   becomes `false`, and no `left` is announced; the entry and its `enteredAt`
