@@ -758,7 +758,7 @@ check('a shared route is not guessed, and setPool settles it', async () => {
   assert.equal(context.service.setPool(session, 'nowhere'), false, 'an unknown pool sets nothing')
 })
 
-check('pickRoute re-reads the pool\'s scripts, then answers from what they reported', async () => {
+check('pickRoute reads the scripts, then answers from what they reported', async () => {
   const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 9}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
@@ -775,11 +775,8 @@ check('pickRoute re-reads the pool\'s scripts, then answers from what they repor
   assert.equal(scripts.spawned.length, 2, 'both scripts ran')
   assert.deepEqual(scripts.spawned[0].argv, ['probe-script'])
 
-  // The queued stdout is spent, so both scripts now report nothing at all. Every
-  // choice re-reads the pool, and a run that reports nothing leaves the last good
-  // reading standing rather than withdrawing it.
   assert.deepEqual(await context.service.pickRoute('medium'), { provider: 'high', model: 'h' })
-  assert.equal(scripts.spawned.length, 4, 'a second choice re-reads the pool instead of trusting its cache')
+  assert.equal(scripts.spawned.length, 2, 'a reading inside its refresh interval is not asked for again')
   assert.equal(await context.service.pickRoute('unknown-pool'), undefined)
 })
 

@@ -43,11 +43,12 @@
  * The route a Session *starts* on is the pool's to choose in either case: a
  * Session that has not made a request through this plugin yet is drawn from its
  * pool in proportion to what each route has left, and `midSessionSwitch` refuses
- * only the moves that follow that start. That draw waits for the pool's balance
- * scripts, because a route chosen from a reading the pool has not just asked
- * about is a guess: every choice re-reads the pool's own providers first, and the
- * wait is bounded by each source's own `timeoutMs`. A request that only checks
- * the route a running Session is on starts no script and waits for nothing.
+ * only the moves that follow that start. That draw is made from readings the pool
+ * owns, never from the absence of one: a source whose reading is missing or older
+ * than its own `refreshMs` is asked again and the draw waits for it, bounded by
+ * that source's `timeoutMs`, while a reading inside its own interval answers with
+ * no round trip. A request that only checks the route a running Session is on
+ * starts no script and waits for nothing.
  *
  * Which pool governs a Session is a setting of its own, in the same record and
  * with the same inheritance: written through `/quota-pool` or the composer chip
@@ -208,18 +209,21 @@ export function apply(ctx, config = {}, internals = {}) {
   }))
 
   /**
-   * Read the providers one pool can use, now.
+   * Read the providers one pool can use, answering from the readings it holds
+   * wherever those are still good enough.
    *
    * Only a pool's own providers are read: a route another pool holds is not worth
-   * a round trip here. Every run is forced, because these readings are what the
-   * caller's route choice is made from, so a reading of any age is not evidence
-   * enough to choose on.
+   * a round trip here. A source whose reading is missing or older than its own
+   * `refreshMs` is run again and this waits for it, because a route drawn from a
+   * reading the pool has not looked at lately is a guess; a reading inside that
+   * interval answers with no round trip at all, which is what bounds how often the
+   * scripts start.
    *
    * @param poolName - the pool whose routes are worth reading.
-   * @returns resolution once every run settled.
+   * @returns resolution once every run that was due settled.
    */
   function refreshPool(poolName) {
-    return balances.refreshAll({ providers: routes.pools[poolName].routes.map(route => route.provider) })
+    return balances.refreshStale({ providers: routes.pools[poolName].routes.map(route => route.provider) })
   }
 
   /**
@@ -448,14 +452,15 @@ export function apply(ctx, config = {}, internals = {}) {
   // allowance. A Session that has not made a request here is starting, and its
   // starting route is drawn from the pool in proportion to headroom whatever
   // `midSessionSwitch` says — the flag refuses the moves that follow a start, not
-  // the start itself. Choosing waits for the pool's balance scripts: the draw is
-  // made from readings this hook reads first, so no Session starts on a route the
-  // pool has not just asked about. A request that only checks the route a running
-  // Session is on waits for nothing, because that check is made against the
-  // provider's own exhaustion mark rather than a reading. A reading below the
-  // route's own threshold still does not move a Session that has already started:
-  // the threshold decides which route a Session starts on, not whether it is
-  // interrupted.
+  // the start itself. Choosing waits for the pool's balance readings: a source
+  // whose reading is missing or past its own `refreshMs` is asked again before the
+  // draw, so no Session starts on a route the pool has not looked at lately, and a
+  // reading still inside its interval answers without a round trip. A request that
+  // only checks the route a running Session is on waits for nothing, because that
+  // check is made against the provider's own exhaustion mark rather than a
+  // reading. A reading below the route's own threshold still does not move a
+  // Session that has already started: the threshold decides which route a Session
+  // starts on, not whether it is interrupted.
   const disposeRequest = ctx.on('agent/request', async ({ agent, signal }, next) => {
     const resolved = await next()
     const session = agent.session

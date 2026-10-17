@@ -291,8 +291,8 @@ provider, no dependencies, each printing one JSON reading on stdout.
         apiKeyEnv: GATEWAY_A_API_KEY      # resolved through the credential service, then forwarded
         unit: percent             # what `remaining` counts, for a person reading it
         minimumRemaining: 5       # below this a route is not chosen, and never one already running
-        refreshMs: 60000          # how long after a failure a reading may clear its exhaustion mark
-        timeoutMs: 5000           # how long a route choice waits for this script at most
+        refreshMs: 60000          # how long a reading answers a route draw without a new run
+        timeoutMs: 5000           # and how long that draw waits for this script at most
         coefficients:             # how the windows this script reports are weighed
           five-hour: 1            # a window the map does not name weighs 1
           monthly: 0.25           # a month of credits matters a quarter as much
@@ -420,14 +420,17 @@ That split is deliberate: another account can mean another model, another prompt
 cache, and another price, so a live conversation is only moved when the route it
 is on cannot answer at all.
 
-**A session's first request is where the pool chooses, and it waits for the
-balance.** A session that has not made a request through this plugin yet has no
-conversation to protect, so its starting route is drawn from its pool by the rule
-below, whatever `midSessionSwitch` says — and that draw is made from readings the
-pool's own providers have just been asked for, so no session starts on a route the
-pool has not just checked. Every choice re-reads them: a reading of any age is not
-evidence enough to choose on, and the wait is bounded by each source's own
-`timeoutMs`, so a script that hangs costs its timeout and not the request.
+**A session's first request is where the pool chooses, and it never chooses
+without a balance to choose from.** A session that has not made a request through
+this plugin yet has no conversation to protect, so its starting route is drawn from
+its pool by the rule below, whatever `midSessionSwitch` says. That draw is made
+from readings the pool owns: a source whose reading is missing or older than its
+own `refreshMs` is asked again first and the draw waits for it, and a reading
+inside that interval answers with no round trip. So the common case costs nothing,
+the interval bounds how often the scripts start, and the draw is never made from
+the *absence* of a reading — the one case that used to hand a session a route in
+declared order. The wait is bounded by each source's own `timeoutMs`, so a script
+that hangs costs its timeout and not the request.
 
 **Choosing a route**, in this order:
 
@@ -514,14 +517,15 @@ still *start* on whichever of those models has the most left.
 - **At every request**, the route the session would otherwise use is drawn from its
   pool in proportion to headroom while the session is still starting, and replaced
   once it has started when its provider has **reported the allowance spent** and the
-  pool holds a route that has not. Drawing waits for the pool's balance scripts and
-  only marks once they have answered; replacing waits for nothing at all, because
-  that decision is made against the provider's own exhaustion mark rather than a
-  reading, and a provider that just refused a request is the last thing worth
-  waiting on. A reading below a route's threshold does not move a session that has
-  already started (see "How a route is chosen"), a pool that refuses mid-session
-  switching never moves it here either, and a route the user picked in the model
-  picker is left alone as soon as it falls outside the session's pool.
+  pool holds a route that has not. Drawing waits for whichever of the pool's
+  balance scripts are due and only marks once they have answered; replacing waits
+  for nothing at all, because that decision is made against the provider's own
+  exhaustion mark rather than a reading, and a provider that just refused a
+  request is the last thing worth waiting on. A reading below a route's threshold
+  does not move a session that has already started (see "How a route is chosen"), a
+  pool that refuses mid-session switching never moves it here either, and a route
+  the user picked in the model picker is left alone as soon as it falls outside the
+  session's pool.
 - **Which pool governs a session**: the one the session states (`/quota-pool`,
   the chip, or the delegation plugin that created it), or — when it states none —
   the single pool that holds the route the session is on. A route two pools share
@@ -529,9 +533,9 @@ still *start* on whichever of those models has the most left.
   pool is what makes a pool name mean the same thing to a delegating session and
   to its child.
 - **A new session** can ask for a route before it exists, through `pickRoute`,
-  which re-reads **that pool's own providers** first, so a pool never probes a
-  provider it cannot use and the wait is bounded by the slowest script in that
-  pool. This
+  which reads **that pool's own providers** first — asking again for whichever of
+  them are due — so a pool never probes a provider it cannot use and the wait is
+  bounded by the slowest script that actually ran. This
   is the delegation-time half: `dsh-subagent-templates` templates name a pool and
   call it for every child they create — one route per child, drawn in proportion
   to headroom, so two subagents of one template start on different routes without
@@ -582,8 +586,9 @@ in-memory: it exists only while a wait is live.
 ```js
 // Choose the route a session that does not exist yet should start on: one draw
 // over the pool's usable routes, each in proportion to what it has left, so two
-// calls can answer differently by design. Re-reads that pool's providers first, so
-// it may wait up to the slowest of THEIR scripts' `timeoutMs`.
+// calls can answer differently by design. Asks again for the pool's sources whose
+// reading is missing or past their own `refreshMs`, so it may wait up to the
+// slowest of THOSE scripts' `timeoutMs`.
 // `undefined` means no pool by that name exists — a config error at the caller.
 // It rejects when a route of the pool names a provider no adapter serves, which
 // is also a config error at the caller; see
@@ -718,12 +723,13 @@ export function apply(ctx) {
 - **Each long-term attempt is a billed provider request.** The schedule is
   unbounded by design: nothing but a successful request, cancellation, the switch
   going off, or unloading the plugin stops it.
-- **Every route choice pays for the pool's balance scripts.** Drawing a session's
-  starting route re-reads that pool's providers first and waits for them, so a
-  choice is never made from a reading the pool has not just asked about. The wait
+- **A route choice waits only for the balance scripts that are due.** Drawing a
+  session's starting route asks again for the pool's sources whose reading is
+  missing or past their own `refreshMs`, and waits for exactly those; a reading
+  still inside its interval answers the draw with no round trip at all. The wait
   is bounded by each source's own `timeoutMs` and by nothing else: losing a
   script's output costs a reading and the timeout, never the request, and a route
-  with no reading falls back to `failOpen`.
+  with no reading at all falls back to `failOpen`.
 - **A provider's own failure outranks its script.** A reading taken right after
   an exhaustion mark cannot withdraw it (it must be at least one `refreshMs`
   later), so a script with its own cache cannot bounce a session straight back
