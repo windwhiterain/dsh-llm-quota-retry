@@ -203,13 +203,15 @@ function dispatchSessionEvent(context, session, event) {
  * @param context - the fake context.
  * @param caller - the Agent making the request.
  * @param proposal - the provider/model the request resolves to without this plugin.
+ * @param signal - the turn-abort signal the payload carries, aborted by default
+ *   only when the caller asks for it through `abort`.
  * @returns the config the request goes out with.
  */
-async function dispatchRequest(context, caller, proposal) {
+async function dispatchRequest(context, caller, proposal, signal = new AbortController().signal) {
   const chain = [...(context.hooks.get('agent/request') ?? [])]
   const run = index => index >= chain.length
     ? Promise.resolve(proposal)
-    : chain[index]({ agent: caller }, () => run(index + 1))
+    : chain[index]({ agent: caller, signal }, () => run(index + 1))
   return run(0)
 }
 
@@ -756,7 +758,7 @@ check('a shared route is not guessed, and setPool settles it', async () => {
   assert.equal(context.service.setPool(session, 'nowhere'), false, 'an unknown pool sets nothing')
 })
 
-check('pickRoute reads the scripts, then answers in declared order from the cache', async () => {
+check('pickRoute re-reads the pool\'s scripts, then answers from what they reported', async () => {
   const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 9}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
@@ -773,8 +775,11 @@ check('pickRoute reads the scripts, then answers in declared order from the cach
   assert.equal(scripts.spawned.length, 2, 'both scripts ran')
   assert.deepEqual(scripts.spawned[0].argv, ['probe-script'])
 
-  await context.service.pickRoute('medium')
-  assert.equal(scripts.spawned.length, 2, 'a reading inside its refresh interval is not probed again')
+  // The queued stdout is spent, so both scripts now report nothing at all. Every
+  // choice re-reads the pool, and a run that reports nothing leaves the last good
+  // reading standing rather than withdrawing it.
+  assert.deepEqual(await context.service.pickRoute('medium'), { provider: 'high', model: 'h' })
+  assert.equal(scripts.spawned.length, 4, 'a second choice re-reads the pool instead of trusting its cache')
   assert.equal(await context.service.pickRoute('unknown-pool'), undefined)
 })
 
@@ -1075,28 +1080,71 @@ check('a pool that refuses mid-session switching still starts a session by headr
   assert.equal(await pending, undefined)
 })
 
-check('a starting session reads its pool in the background', async () => {
-  const scripts = createSubprocess(['{"remaining": 5}'])
+check('a starting session waits for its pool\'s balance scripts before it is routed', async () => {
+  const scripts = createSubprocess(['{"remaining": 0}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
     longTermDelayMs: 60_000,
     pools: {
-      medium: { routes: [{ provider: 'inside', model: 'i' }] },
+      medium: { routes: [{ provider: 'inside', model: 'i' }, { provider: 'spare', model: 's' }] },
       other: { routes: [{ provider: 'outside', model: 'o' }] },
     },
     balances: [
-      { provider: 'inside', script: ['probe-script'] },
+      { provider: 'inside', script: ['probe-script'], minimumRemaining: 1 },
+      { provider: 'spare', script: ['probe-script'] },
       { provider: 'outside', script: ['probe-script'] },
     ],
   })
   assert.deepEqual(await dispatchRequest(context, agent, { provider: 'inside', model: 'i' }), {
-    provider: 'inside',
-    model: 'i',
-  }, 'nothing is scored yet, so the declared order answers')
-  await settled()
-  assert.equal(scripts.spawned.length, 1, 'the pool the session started in is read for the next start')
+    provider: 'spare',
+    model: 's',
+  }, 'a route the pool has just been told is spent is not the one the request starts on')
+  assert.equal(scripts.spawned.length, 2, 'both of that pool\'s scripts ran, and the request waited for them')
   assert.equal(context.service.report().find(pool => pool.name === 'other').routes[0].reading, undefined,
     'and no provider outside that pool is probed')
+  await context.dispose()
+})
+
+check('a cancelled turn stops waiting for a probe without cutting it off', async () => {
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const spawned = []
+  // A script whose run stays open until released, so the turn really is waiting
+  // on it when the abort arrives.
+  const scripts = {
+    spawned,
+    spawn(spec) {
+      spawned.push(spec)
+      return {
+        done: gate.then(() => ({ exitCode: 0, signal: null })),
+        collected: {
+          stdout: { readFrom: () => ({ text: '{"remaining": 0}', nextOffset: 0, lossy: false }) },
+          stderr: { readFrom: () => ({ text: '', nextOffset: 0, lossy: false }) },
+        },
+        terminate() {},
+        waitForExit: () => Promise.resolve(true),
+      }
+    },
+  }
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: { medium: { routes: [{ provider: 'inside', model: 'i' }] } },
+    balances: [{ provider: 'inside', script: ['probe-script'], minimumRemaining: 1 }],
+  })
+  const controller = new AbortController()
+  const pending = dispatchRequest(context, agent, { provider: 'inside', model: 'i' }, controller.signal)
+  await settled()
+  assert.equal(spawned.length, 1, 'the turn is waiting on the script')
+  controller.abort()
+  assert.deepEqual(await pending, { provider: 'inside', model: 'i' },
+    'the cancelled turn stops waiting and answers on the readings it already had')
+  assert.equal(context.service.report()[0].routes[0].reading, undefined,
+    'the script it gave up on had reported nothing yet')
+  release()
+  await settled()
+  assert.equal(context.service.report()[0].routes[0].reading.remaining, 0,
+    'and the script it gave up on still ran to its end')
   await context.dispose()
 })
 

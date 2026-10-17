@@ -43,9 +43,11 @@
  * The route a Session *starts* on is the pool's to choose in either case: a
  * Session that has not made a request through this plugin yet is drawn from its
  * pool in proportion to what each route has left, and `midSessionSwitch` refuses
- * only the moves that follow that start. The draw reads cached readings and
- * starts a background refresh of the pool's own providers, so a model request is
- * never held behind a balance script.
+ * only the moves that follow that start. That draw waits for the pool's balance
+ * scripts, because a route chosen from a reading the pool has not just asked
+ * about is a guess: every choice re-reads the pool's own providers first, and the
+ * wait is bounded by each source's own `timeoutMs`. A request that only checks
+ * the route a running Session is on starts no script and waits for nothing.
  *
  * Which pool governs a Session is a setting of its own, in the same record and
  * with the same inheritance: written through `/quota-pool` or the composer chip
@@ -74,6 +76,7 @@
 
 import {
   QuotaRetryLedger,
+  aborted,
   cancellableDelay,
   effectiveEnabled,
   isExhaustedAllowanceFailure,
@@ -205,29 +208,28 @@ export function apply(ctx, config = {}, internals = {}) {
   }))
 
   /**
-   * Refresh the readings of the providers one pool can use.
+   * Read the providers one pool can use, now.
    *
    * Only a pool's own providers are read: a route another pool holds is not worth
-   * a round trip here, and `wait` decides whether this decision waits for the
-   * scripts — a delegation may, a model request must not.
+   * a round trip here. Every run is forced, because these readings are what the
+   * caller's route choice is made from, so a reading of any age is not evidence
+   * enough to choose on.
    *
    * @param poolName - the pool whose routes are worth reading.
-   * @param options - `wait: true` awaits the runs, `wait: false` leaves them in
-   *   the background.
-   * @returns resolution after the runs settled, or immediately in the background case.
+   * @returns resolution once every run settled.
    */
-  function refreshPool(poolName, { wait }) {
-    return balances.refreshStale({ wait, providers: routes.pools[poolName].routes.map(route => route.provider) })
+  function refreshPool(poolName) {
+    return balances.refreshAll({ providers: routes.pools[poolName].routes.map(route => route.provider) })
   }
 
   /**
-   * Choose the route a new Session should start on, refreshing stale readings
+   * Choose the route a new Session should start on, reading its pool's balances
    * first.
    *
-   * This is the delegation-time decision, so it may wait for a script; a
-   * model-request decision never does. An unknown pool answers `undefined`,
-   * because that is a configuration error at the caller rather than a route
-   * choice, and the caller reports it as one.
+   * This is the delegation-time choice, so it waits for the pool's balance
+   * scripts. An unknown pool answers `undefined`, because that is a configuration
+   * error at the caller rather than a route choice, and the caller reports it as
+   * one.
    *
    * The answer is drawn with a probability proportional to what each usable
    * route has left, so a pool is spent across its routes rather than drained
@@ -240,7 +242,7 @@ export function apply(ctx, config = {}, internals = {}) {
     const pool = routes.pools[poolName]
     if (pool === undefined) return undefined
     providerCheck.assertRoutable(pool)
-    await refreshPool(poolName, { wait: true })
+    await refreshPool(poolName)
     const chosen = routeState.pick(poolName, Date.now())
     ctx.logger.info(
       `llm-quota-retry: pool "${poolName}" answers ${chosen.provider}/${chosen.model}`
@@ -446,13 +448,15 @@ export function apply(ctx, config = {}, internals = {}) {
   // allowance. A Session that has not made a request here is starting, and its
   // starting route is drawn from the pool in proportion to headroom whatever
   // `midSessionSwitch` says — the flag refuses the moves that follow a start, not
-  // the start itself. The decision reads cached readings, starts a background
-  // refresh of the pool's own providers, and marks only: it waits for nothing,
-  // because a model request must never be held behind a balance probe. A reading
-  // below the route's own threshold does not move a Session that has already
-  // started — that threshold decides which route a Session starts on, not whether
-  // it is interrupted.
-  const disposeRequest = ctx.on('agent/request', async ({ agent }, next) => {
+  // the start itself. Choosing waits for the pool's balance scripts: the draw is
+  // made from readings this hook reads first, so no Session starts on a route the
+  // pool has not just asked about. A request that only checks the route a running
+  // Session is on waits for nothing, because that check is made against the
+  // provider's own exhaustion mark rather than a reading. A reading below the
+  // route's own threshold still does not move a Session that has already started:
+  // the threshold decides which route a Session starts on, not whether it is
+  // interrupted.
+  const disposeRequest = ctx.on('agent/request', async ({ agent, signal }, next) => {
     const resolved = await next()
     const session = agent.session
     const route = { provider: resolved.provider, model: resolved.model }
@@ -474,9 +478,15 @@ export function apply(ctx, config = {}, internals = {}) {
       usedRoutes.set(session.id, route)
       return resolved
     }
+    const choosingRoute = choosing || starting
+    if (choosingRoute) {
+      // The scripts keep running when this turn is cancelled: one run serves
+      // every choice in flight, so a cancelled turn must not cut off the reads
+      // the Session after it is about to make.
+      await Promise.race([refreshPool(poolName), aborted(signal)])
+    }
     const now = Date.now()
-    if (starting) void refreshPool(poolName, { wait: false })
-    const chosen = choosing || starting
+    const chosen = choosingRoute
       ? routeState.pick(poolName, now)
       : routeState.replacementFor(poolName, route, now)
     if (chosen === undefined) {
