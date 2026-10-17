@@ -203,11 +203,11 @@ function dispatchSessionEvent(context, session, event) {
  * @param context - the fake context.
  * @param caller - the Agent making the request.
  * @param proposal - the provider/model the request resolves to without this plugin.
- * @param signal - the turn-abort signal the payload carries, aborted by default
- *   only when the caller asks for it through `abort`.
+ * @param signal - the turn-abort signal the payload carries; omitted when the
+ *   proposal carries none, which is what a caller that predates the field does.
  * @returns the config the request goes out with.
  */
-async function dispatchRequest(context, caller, proposal, signal = new AbortController().signal) {
+async function dispatchRequest(context, caller, proposal, signal = undefined) {
   const chain = [...(context.hooks.get('agent/request') ?? [])]
   const run = index => index >= chain.length
     ? Promise.resolve(proposal)
@@ -1142,6 +1142,25 @@ check('a cancelled turn stops waiting for a probe without cutting it off', async
   await settled()
   assert.equal(context.service.report()[0].routes[0].reading.remaining, 0,
     'and the script it gave up on still ran to its end')
+  await context.dispose()
+})
+
+check('a request proposal carrying no signal is still routed from a reading', async () => {
+  const scripts = createSubprocess(['{"remaining": 0}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: { medium: { routes: [{ provider: 'inside', model: 'i' }, { provider: 'spare', model: 's' }] } },
+    balances: [
+      { provider: 'inside', script: ['probe-script'], minimumRemaining: 1 },
+      { provider: 'spare', script: ['probe-script'] },
+    ],
+  })
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'inside', model: 'i' }), {
+    provider: 'spare',
+    model: 's',
+  }, 'a payload with nothing to cancel it waits for the reading rather than throwing on its absence')
+  assert.equal(scripts.spawned.length, 2, 'and it is routed from the script that reported')
   await context.dispose()
 })
 
