@@ -59,7 +59,10 @@
  * moves entirely. When one has to be chosen, the Session records it as
  * `model/selection`, the event the model picker itself writes, so the Client
  * shows the route in use; the deployment default for new Sessions is never
- * changed by a failover.
+ * changed by a failover. That route governs the Session's later requests too,
+ * until the Session logs a selection this plugin did not write, because the Host
+ * resolves a request from a model-selection cache that the event does not
+ * update.
  *
  * Each Session's live retry state is readable through `ctx.llmQuotaRetry` —
  * along with `pickRoute` (choose a route for a Session that does not exist yet),
@@ -183,6 +186,15 @@ export function apply(ctx, config = {}, internals = {}) {
   const disposeAdaptersUpdated = ctx.on('llm/adapters-updated', () => { providerCheck.observe() })
   /** Session id -> the route its last request used, for failover and the chip. */
   const usedRoutes = new Map()
+  /**
+   * Session id -> the route this plugin moved the Session to, kept until the
+   * Session logs a `model/selection` event this plugin did not write.
+   */
+  const appliedRoutes = new Map()
+  /** Session id -> `seq` of the last `model/selection` event this plugin wrote. */
+  const ownSelections = new Map()
+  /** Session id -> `seq` of the last `model/selection` event the Session logged. */
+  const lastSelections = new Map()
   /**
    * Sessions that were just put in a pool, so their next request moves into it
    * even when the model they are on belongs to no pool. A pool change is a
@@ -332,17 +344,28 @@ export function apply(ctx, config = {}, internals = {}) {
    * was created with. The deployment default is deliberately untouched: a quota
    * failover must not change the model new Sessions start from.
    *
+   * The route is also kept here, with the `seq` of the event that recorded it:
+   * appending the event does not update the model-selection cache the Host
+   * resolves later requests from (see the request hook), so the route has to be
+   * re-applied until the Session logs a selection this plugin did not write.
+   *
    * @param session - the Session whose route this is.
    * @param route - the route it will use.
    */
   function applyRoute(session, route) {
     usedRoutes.set(session.id, { provider: route.provider, model: route.model })
-    if (typeof session.append !== 'function') return
-    session.append('model/selection', {
+    appliedRoutes.set(session.id, {
       provider: route.provider,
       model: route.model,
       ...route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort },
     })
+    if (typeof session.append !== 'function') return
+    const recorded = session.append('model/selection', {
+      provider: route.provider,
+      model: route.model,
+      ...route.reasoningEffort === undefined ? {} : { reasoningEffort: route.reasoningEffort },
+    })
+    if (recorded !== undefined) ownSelections.set(session.id, recorded.seq)
   }
 
   function track(operation) {
@@ -439,6 +462,10 @@ export function apply(ctx, config = {}, internals = {}) {
   // whether the provider's own policy already spent this step's retries — the
   // one case in which this plugin must not spend another wait of its own.
   const disposeSuccessListener = ctx.on('session/event', (session, event) => {
+    if (event.type === 'model/selection') {
+      lastSelections.set(session.id, event.seq)
+      return
+    }
     if (event.type === 'llm/retry') {
       noteNativeRetry(session, event.data)
       return
@@ -469,16 +496,41 @@ export function apply(ctx, config = {}, internals = {}) {
     // Read before anything records a route for this Session, because it is what
     // says it has not started yet.
     const starting = !usedRoutes.has(session.id)
-    if (!enabledForSession(session)) {
+    const enabled = enabledForSession(session)
+    const stated = poolSettingOf(records.get(session.id))
+    // Naming a pool is a choice to move into it, so it overrides the hold below;
+    // `off` and `default` leave the Session where it is.
+    const poolChoice = choosing && stated.explicit && stated.name !== null
+    // A `model/selection` event this plugin did not write is a person choosing a
+    // model through the picker, which ends the plugin's hold on the route.
+    if (poolChoice || (lastSelections.get(session.id) ?? -1) > (ownSelections.get(session.id) ?? -1)) {
+      appliedRoutes.delete(session.id)
+    }
+    // The Host resolves the route from its own model-selection cache before this
+    // listener runs, and the `model/selection` event this plugin appends does not
+    // update that cache: it clears only when a request actually uses the cached
+    // route. While nothing has selected a model since this plugin moved the
+    // Session, the route it applied is the one the request uses. Without this the
+    // Host proposes the pre-move route on the very next request, so every draw,
+    // failover, and pool choice lasts exactly one request — and a pool that
+    // refuses mid-session switching never gets it back.
+    const applied = appliedRoutes.get(session.id)
+    if (applied !== undefined) {
+      usedRoutes.set(session.id, { provider: applied.provider, model: applied.model })
+      return {
+        ...resolved,
+        provider: applied.provider,
+        model: applied.model,
+        ...applied.reasoningEffort === undefined ? {} : { reasoningEffort: applied.reasoningEffort },
+      }
+    }
+    if (!enabled) {
       usedRoutes.set(session.id, route)
       return resolved
     }
     // A Session just put in a pool is moved into it even when the model it is on
     // belongs to no pool: choosing a pool is choosing to leave that model behind.
-    const stated = poolSettingOf(records.get(session.id))
-    const poolName = choosing && stated.explicit && stated.name !== null
-      ? stated.name
-      : poolFor(session, route)
+    const poolName = poolChoice ? stated.name : poolFor(session, route)
     if (poolName === undefined) {
       usedRoutes.set(session.id, route)
       return resolved

@@ -246,7 +246,10 @@ function fakeSession(id, parent) {
   return {
     id,
     header: { id, ...(parent === undefined ? {} : { parentSession: parent }) },
-    append(type, data) { appended.push({ id, type, data }) },
+    append(type, data) {
+      appended.push({ id, type, data })
+      return { type, seq: appended.length, time: Date.now(), data }
+    },
   }
 }
 
@@ -1075,6 +1078,71 @@ check('a pool that refuses mid-session switching still starts a session by headr
   )
   await context.dispose()
   assert.equal(await pending, undefined)
+})
+
+check('a route the pool drew survives the model-selection cache the Host resolves first', async () => {
+  const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 50}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: {
+      held: {
+        midSessionSwitch: false,
+        routes: [{ provider: 'qwen', model: 'q' }, { provider: 'kimi', model: 'k' }],
+      },
+    },
+    balances: [
+      { provider: 'qwen', script: ['probe-script'], minimumRemaining: 1 },
+      { provider: 'kimi', script: ['probe-script'], minimumRemaining: 1 },
+    ],
+  })
+  // The Host's `installModelSelection` registers a listener per Agent, after this
+  // plugin, and resolves every request from the selection captured at prompt
+  // assembly. A route a request never used stays in that cache, so the cache
+  // proposes the pre-move route again until some request actually uses it.
+  const picked = { provider: 'qwen', model: 'q' }
+  context.on('agent/request', async (_payload, next) => ({ ...await next(), ...picked }))
+  assert.deepEqual(await dispatchRequest(context, agent, { ...picked }), { provider: 'kimi', model: 'k' },
+    'the starting route is drawn from the pool')
+  assert.deepEqual(await dispatchRequest(context, agent, { ...picked }), { provider: 'kimi', model: 'k' },
+    'and the next request keeps it instead of falling back to the cache')
+  assert.deepEqual(await dispatchRequest(context, agent, { ...picked }), { provider: 'kimi', model: 'k' })
+  await context.dispose()
+})
+
+check('a model the user selects ends the route this plugin applied', async () => {
+  const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 50}'])
+  const context = createContext({ subprocess: scripts })
+  apply(context, {
+    longTermDelayMs: 60_000,
+    pools: {
+      held: {
+        midSessionSwitch: false,
+        routes: [{ provider: 'qwen', model: 'q' }, { provider: 'kimi', model: 'k' }],
+      },
+    },
+    balances: [
+      { provider: 'qwen', script: ['probe-script'], minimumRemaining: 1 },
+      { provider: 'kimi', script: ['probe-script'], minimumRemaining: 1 },
+    ],
+  })
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'qwen', model: 'q' }), {
+    provider: 'kimi',
+    model: 'k',
+  })
+  // The model picker appends `model/selection`; that event, not the proposal the
+  // Host resolves, is what says a person chose a model.
+  dispatchSessionEvent(context, session, {
+    type: 'model/selection',
+    seq: appended.length + 1,
+    time: Date.now(),
+    data: { provider: 'qwen', model: 'q' },
+  })
+  assert.deepEqual(await dispatchRequest(context, agent, { provider: 'qwen', model: 'q' }), {
+    provider: 'qwen',
+    model: 'q',
+  }, 'a model the user picks is left alone even while this plugin still holds its own route')
+  await context.dispose()
 })
 
 check('a starting session waits for its pool\'s balance scripts before it is routed', async () => {

@@ -526,6 +526,15 @@ still *start* on whichever of those models has the most left.
   pool that refuses mid-session switching never moves it here either, and a route
   the user picked in the model picker is left alone as soon as it falls outside the
   session's pool.
+- **A route the plugin chose governs the session until someone else chooses one.**
+  The Host resolves each request from the model selection it captured at prompt
+  assembly, and the `model/selection` event a move appends does not update that
+  selection: it is cleared only when a request actually uses the cached route. So
+  the chosen route is re-applied to every later request of that session, which is
+  what makes a draw, a failover, or a pool choice outlast the one request it was
+  made for. A `model/selection` event the plugin did not write — the model
+  picker, the `/model` popup — releases it at once, and naming a pool with
+  `/quota-pool` or the chip moves the session into that pool's next draw.
 - **Which pool governs a session**: the one the session states (`/quota-pool`,
   the chip, or the delegation plugin that created it), or — when it states none —
   the single pool that holds the route the session is on. A route two pools share
