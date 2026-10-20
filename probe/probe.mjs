@@ -15,11 +15,21 @@ import { DEFAULT_ENABLED, QUOTA_EXCEEDED_CODE, isExhaustedAllowanceFailure, reso
 /** Minimal `ctx.sessionProjections` surface the plugin registers against. */
 function createProjectionRegistry() {
   const definitions = new Map()
+  const listeners = new Set()
   return {
     definitions,
     register(definition) {
       definitions.set(definition.key, definition)
       return () => definitions.delete(definition.key)
+    },
+    /** The Host's change feed, for a delegator publishing its children. */
+    onChanged(listener) {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    /** One delegating Session publishing a view, as the Host would announce it. */
+    publish(session, key, value) {
+      for (const listener of listeners) listener(session, key, value, 0)
     },
     /** Fold one Session from `init`, the only path the probe needs. */
     stateOf(session) {
@@ -114,7 +124,7 @@ function createSessionRegistry(parents) {
  * finds its dependency, which is how the probe covers the durable and
  * process-local paths with the same plugin code.
  */
-function createContext({ store = new Map(), parents = new Map(), withStorage = false, subprocess = null, credentials = null } = {}) {
+function createContext({ store = new Map(), parents = new Map(), withStorage = false, subprocess = null, credentials = null, agents = new Map() } = {}) {
   const hooks = new Map()
   const emitted = []
   const cleanups = []
@@ -128,6 +138,7 @@ function createContext({ store = new Map(), parents = new Map(), withStorage = f
   if (withStorage) services.set('storageDomain', createStorageDomain(store))
   if (subprocess !== null) services.set('subprocess', subprocess)
   if (credentials !== null) services.set('credentials', credentials)
+  if (agents.size > 0) services.set('agents', { get: id => agents.get(id) })
 
   function effect(callback) {
     // Cordis runs the callback at registration and keeps its returned disposer.
@@ -286,17 +297,83 @@ check('config validation rejects unknown keys, invalid intervals, and non-boolea
   assert.throws(() => resolvePolicy({ longTermDelayMs: 2_147_483_648 }), /no greater than 2147483647/)
   assert.throws(() => resolvePolicy({ defaultEnabled: 'yes' }), /defaultEnabled must be a boolean/)
   assert.throws(() => resolvePolicy({ quickRetries: 3 }), /unknown config key "quickRetries"/)
-  assert.equal(DEFAULT_ENABLED, true, 'a session that owns no setting starts on')
+  assert.equal(DEFAULT_ENABLED, false, 'a session that owns no setting starts off')
   assert.deepEqual(resolvePolicy({}), {
     longTermDelayMs: 3_600_000,
-    defaultEnabled: true,
-    nativeRetryFirstProviders: [],
-  })
-  assert.deepEqual(resolvePolicy({ longTermDelayMs: 1000, defaultEnabled: false }), {
-    longTermDelayMs: 1000,
     defaultEnabled: false,
     nativeRetryFirstProviders: [],
+    delegatedChildren: [],
   })
+  assert.deepEqual(resolvePolicy({ longTermDelayMs: 1000, defaultEnabled: true }), {
+    longTermDelayMs: 1000,
+    defaultEnabled: true,
+    nativeRetryFirstProviders: [],
+    delegatedChildren: [],
+  })
+})
+
+check('delegated work is declared as projection sources, or not at all', () => {
+  assert.deepEqual(
+    resolvePolicy({ delegatedChildren: [{ projectionKey: 'subagentTemplates' }] }).delegatedChildren,
+    [{ projectionKey: 'subagentTemplates', rowsField: 'children', sessionIdField: 'childSessionId' }],
+    'the field names a delegator publishes are the defaults',
+  )
+  assert.throws(() => resolvePolicy({ delegatedChildren: 'subagentTemplates' }), /must be an array of projection sources/)
+  assert.throws(() => resolvePolicy({ delegatedChildren: [null] }), /delegatedChildren\[0\] must be an object/)
+  assert.throws(() => resolvePolicy({ delegatedChildren: [{}] }), /projectionKey must be a non-empty string/)
+  assert.throws(
+    () => resolvePolicy({ delegatedChildren: [{ projectionKey: 'a', nameField: 'name' }] }),
+    /delegatedChildren\[0\] has unknown key "nameField"/,
+    'a field this plugin never reads is a configuration error, not a hint',
+  )
+  assert.throws(() => resolvePolicy({ delegatedChildren: [{ projectionKey: 'a', rowsField: '' }] }), /field names must be non-empty strings/)
+  assert.throws(
+    () => resolvePolicy({ delegatedChildren: [{ projectionKey: 'a' }, { projectionKey: 'a' }] }),
+    /names projection "a" twice/,
+  )
+})
+
+check('the switch is off by default and on for work the deployment declares delegated', () => {
+  const parent = fakeSession('probe-parent')
+  // A delegator that keeps its children looking like full sessions gives them a
+  // root header: no depth, no subagent origin.
+  const child = fakeSession('probe-child', 'probe-parent')
+  const subagent = fakeSession('probe-subagent')
+  subagent.header = { id: 'probe-subagent', delegationDepth: 1 }
+  const agents = new Map([
+    ['probe-parent', { session: parent }],
+    ['probe-child', { session: child }],
+    ['probe-subagent', { session: subagent }],
+  ])
+
+  const declared = createContext({ agents })
+  apply(declared, { longTermDelayMs: 5, delegatedChildren: [{ projectionKey: 'subagentTemplates' }] })
+  declared.projections.publish(parent, 'subagentTemplates', {
+    children: [{ childSessionId: 'probe-child', name: 'Medium' }],
+  })
+  assert.equal(declared.projections.stateOf(subagent).enabled, true, 'a header that says subagent is delegated work')
+  assert.equal(declared.projections.stateOf(child).enabled, true, 'a root session the delegator names is delegated work too')
+  assert.equal(declared.projections.stateOf(parent).enabled, false, 'the delegating conversation itself is left alone')
+
+  declared.projections.publish(parent, 'subagentTemplates', { children: [] })
+  assert.equal(
+    declared.projections.stateOf(child).enabled,
+    false,
+    'a delegator that no longer names the child hands it back to the default',
+  )
+
+  const undeclared = createContext({ agents })
+  apply(undeclared, { longTermDelayMs: 5 })
+  undeclared.projections.publish(parent, 'subagentTemplates', {
+    children: [{ childSessionId: 'probe-child', name: 'Medium' }],
+  })
+  assert.equal(undeclared.projections.stateOf(subagent).enabled, true, 'a subagent needs no configuration')
+  assert.equal(
+    undeclared.projections.stateOf(child).enabled,
+    false,
+    'a root session whose projection the deployment declared no source for is not delegated work',
+  )
+  assert.equal(undeclared.projections.stateOf(parent).enabled, false)
 })
 
 check('the native-first provider list takes harness provider ids, once each', () => {
@@ -520,8 +597,18 @@ check('a later quota failure after recovery announces entry again', async () => 
 })
 
 check('the switch starts from the deployment default and the projection reports it', async () => {
+  const omitted = createContext()
+  apply(omitted, { longTermDelayMs: 5 })
+  assert.deepEqual(omitted.projections.view(session), {
+    enabled: false,
+    defaultEnabled: false,
+    source: 'default',
+    pool: null,
+    poolSource: 'default',
+    pools: [],
+  }, 'a Session that owns no setting starts off, so this plugin never redraws a picker')
   const on = createContext()
-  apply(on, { longTermDelayMs: 5 })
+  apply(on, { longTermDelayMs: 5, defaultEnabled: true })
   assert.deepEqual(on.projections.view(session), {
     enabled: true,
     defaultEnabled: true,
@@ -545,7 +632,7 @@ check('the switch starts from the deployment default and the projection reports 
 
 check('/quota-retry off and on move the switch and the projection follows', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 5 })
+  apply(context, { longTermDelayMs: 5, defaultEnabled: true })
   const disable = await context.commands.run(agent, 'off')
   assert.equal(disable.kind, 'success')
   assert.deepEqual(context.projections.view(session), {
@@ -660,6 +747,7 @@ check('disposal aborts a pending wait, drops the service, and leaves nothing beh
 check('a pooled session moves to a route with allowance and retries at once', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
     balances: [{ provider: 'second', script: ['probe-script'], minimumRemaining: 1 }],
@@ -690,6 +778,7 @@ check('a reading below the threshold leaves a running session where it is', asyn
   const scripts = createSubprocess(['{"remaining": 0}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
     balances: [{ provider: 'first', script: ['probe-script'], minimumRemaining: 1 }],
@@ -712,6 +801,7 @@ check('a reading below the threshold leaves a running session where it is', asyn
 check('a pool with nothing usable falls back to the long-term wait', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 15,
     pools: { medium: { routes: [{ provider: 'only', model: 'solo' }] } },
   })
@@ -742,6 +832,7 @@ check('the switch off leaves a pooled session on the route it proposed', async (
 check('a shared route is not guessed, and setPool settles it', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: {
       left: { routes: [{ provider: 'both', model: 'either' }, { provider: 'fallback', model: 'backup' }] },
@@ -765,6 +856,7 @@ check('pickRoute reads the scripts, then answers from what they reported', async
   const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 9}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: { medium: { routes: [{ provider: 'low', model: 'l' }, { provider: 'high', model: 'h' }] } },
     balances: [
@@ -787,6 +879,7 @@ check('a failing balance script costs a reading, not the request', async () => {
   const scripts = createSubprocess([null])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: { medium: { routes: [{ provider: 'broken', model: 'b' }, { provider: 'other', model: 'o' }] } },
     balances: [{ provider: 'broken', script: ['probe-script'], minimumRemaining: 1 }],
@@ -802,6 +895,7 @@ check('/quota-routes reports pools, readings, and exhaustion marks', async () =>
   const scripts = createSubprocess(['{"remaining": 4, "resetsAt": "2026-01-01T00:00:00.000Z"}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: {
       medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] },
@@ -858,6 +952,7 @@ check('a balance script receives the credential its apiKeyEnv names', async () =
     },
   })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } },
     balances: [{ provider: 'first', script: ['probe-script'], apiKeyEnv: 'PROBE_KEY', minimumRemaining: 1 }],
@@ -874,6 +969,7 @@ check('an unconfigured credential leaves the script to report it', async () => {
     credentials: { resolve: async () => undefined },
   })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } },
     balances: [
@@ -888,6 +984,7 @@ check('choosing a route probes only that pool\'s providers', async () => {
   const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 0}', '{"remaining": 0}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: {
       first: { routes: [{ provider: 'inside', model: 'i' }] },
@@ -914,6 +1011,7 @@ check('pickRoute draws a route in proportion to what each one has left', async (
   const context = createContext({ subprocess: scripts })
   let draw = 0.5
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: { medium: { routes: [{ provider: 'rich', model: 'r' }, { provider: 'poor', model: 'p' }] } },
     balances: [
@@ -957,7 +1055,7 @@ check('a failover draws from the scored routes, and an unread one is only a fall
   async function failoverFrom(startDraw, draw, readings, balances) {
     const context = createContext({ subprocess: createSubprocess([...readings]) })
     let sample = startDraw
-    apply(context, { longTermDelayMs: 60_000, pools: { medium }, balances }, { random: () => sample })
+    apply(context, { longTermDelayMs: 60_000, defaultEnabled: true, pools: { medium }, balances }, { random: () => sample })
     await context.service.pickRoute('medium')
     // The first request is the starting draw, so the session is already running on
     // the route the failover below has to leave.
@@ -1000,6 +1098,7 @@ check('a failover draws from the scored routes, and an unread one is only a fall
 check('a pool that refuses mid-session switching waits where the session is', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: {
       held: {
@@ -1028,6 +1127,7 @@ check('a session that has not started is drawn from its pool by headroom', async
   const scripts = createSubprocess(['{"remaining": 20}', '{"remaining": 80}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: { medium: { routes: [{ provider: 'rich', model: 'r' }, { provider: 'poor', model: 'p' }] } },
     balances: [
@@ -1053,6 +1153,7 @@ check('a pool that refuses mid-session switching still starts a session by headr
   const scripts = createSubprocess(['{"remaining": 80}', '{"remaining": 20}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: {
       held: {
@@ -1084,6 +1185,7 @@ check('a route the pool drew survives the model-selection cache the Host resolve
   const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 50}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: {
       held: {
@@ -1114,6 +1216,7 @@ check('a model the user selects ends the route this plugin applied', async () =>
   const scripts = createSubprocess(['{"remaining": 0}', '{"remaining": 50}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: {
       held: {
@@ -1149,6 +1252,7 @@ check('a starting session waits for its pool\'s balance scripts before it is rou
   const scripts = createSubprocess(['{"remaining": 0}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: {
       medium: { routes: [{ provider: 'inside', model: 'i' }, { provider: 'spare', model: 's' }] },
@@ -1193,6 +1297,7 @@ check('a cancelled turn stops waiting for a probe without cutting it off', async
   }
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: { medium: { routes: [{ provider: 'inside', model: 'i' }] } },
     balances: [{ provider: 'inside', script: ['probe-script'], minimumRemaining: 1 }],
@@ -1217,6 +1322,7 @@ check('a request proposal carrying no signal is still routed from a reading', as
   const scripts = createSubprocess(['{"remaining": 0}'])
   const context = createContext({ subprocess: scripts })
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: { medium: { routes: [{ provider: 'inside', model: 'i' }, { provider: 'spare', model: 's' }] } },
     balances: [
@@ -1235,6 +1341,7 @@ check('a request proposal carrying no signal is still routed from a reading', as
 check('a pool that refuses mid-session switching still moves a session the user puts in it', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: {
       held: {
@@ -1256,6 +1363,7 @@ check('a pool that refuses mid-session switching still moves a session the user 
 check('/quota-pool states a pool, and the next request moves into it', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
   })
@@ -1291,6 +1399,7 @@ check('/quota-pool states a pool, and the next request moves into it', async () 
 check('/quota-pool off stops route moves, and default clears the pool', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 5,
     pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
   })
@@ -1315,7 +1424,7 @@ check('/quota-pool off stops route moves, and default clears the pool', async ()
 
 check('/quota-pool rejects an unknown pool and reports status', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 5, pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } } })
+  apply(context, { longTermDelayMs: 5, defaultEnabled: true, pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } } })
   const bad = await context.commands.runNamed('quota-pool', 'nope', agent)
   assert.equal(bad.kind, 'error')
   assert.match(bad.text, /expected one of medium, off, default, or status/)
@@ -1333,13 +1442,13 @@ check('a stated pool survives a host restart through the storage domain', async 
   const parents = new Map()
   const pools = { medium: { routes: [{ provider: 'first', model: 'one' }] } }
   const first = createContext({ store, parents, withStorage: true })
-  apply(first, { longTermDelayMs: 5, pools })
+  apply(first, { longTermDelayMs: 5, defaultEnabled: true, pools })
   await first.commands.runNamed('quota-pool', 'medium', agent)
   await settled()
   assert.equal(store.get('probe-session').pool, 'medium')
 
   const second = createContext({ store, parents, withStorage: true })
-  apply(second, { longTermDelayMs: 5, pools })
+  apply(second, { longTermDelayMs: 5, defaultEnabled: true, pools })
   await settled()
   assert.equal(second.projections.view(session).pool, 'medium')
   assert.equal(second.projections.view(session).poolSource, 'session')
@@ -1347,7 +1456,7 @@ check('a stated pool survives a host restart through the storage domain', async 
 
 check('a forked session inherits the pool its nearest ancestor stated', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 5, pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } } })
+  apply(context, { longTermDelayMs: 5, defaultEnabled: true, pools: { medium: { routes: [{ provider: 'first', model: 'one' }] } } })
   const parent = fakeSession('parent-session', 'grandparent-session')
   context.parents.set('child-session', 'parent-session')
   await context.commands.runNamed('quota-pool', 'medium', { session: parent })
@@ -1359,6 +1468,7 @@ check('a forked session inherits the pool its nearest ancestor stated', async ()
 check('a failover records the route it moves to on the session', async () => {
   const context = createContext()
   apply(context, {
+    defaultEnabled: true,
     longTermDelayMs: 60_000,
     pools: { medium: { routes: [{ provider: 'first', model: 'one' }, { provider: 'second', model: 'two' }] } },
   })
@@ -1396,7 +1506,7 @@ function nativeRetryEvent(overrides) {
 
 check('a named provider runs its own native schedule, then hands over to the hourly wait', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  apply(context, { longTermDelayMs: 60_000, defaultEnabled: true, nativeRetryFirstProviders: ['probe-provider'] })
   const policy = nativePolicy(2)
 
   const first = Date.now()
@@ -1428,7 +1538,7 @@ check('a named provider runs its own native schedule, then hands over to the hou
 
 check('the quick budget is spent per step, not per session', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  apply(context, { longTermDelayMs: 60_000, defaultEnabled: true, nativeRetryFirstProviders: ['probe-provider'] })
   const policy = nativePolicy(1)
   assert.deepEqual(await dispatchFailure(context, { ...request, retryPolicy: policy }), { kind: 'retry' })
   const nextStep = await dispatchFailure(context, { ...request, retryPolicy: policy, step: 2 })
@@ -1438,7 +1548,7 @@ check('the quick budget is spent per step, not per session', async () => {
 
 check('a provider the row does not name keeps the interval it had', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  apply(context, { longTermDelayMs: 60_000, defaultEnabled: true, nativeRetryFirstProviders: ['probe-provider'] })
   const started = Date.now()
   const pending = dispatchFailure(context, { ...request, provider: 'other-provider', retryPolicy: nativePolicy(5) })
   await new Promise(resolve => setTimeout(resolve, 10))
@@ -1452,7 +1562,7 @@ check('a provider with no bounded native schedule of its own answers with the in
   const schedules = [undefined, { mode: 'always', initialDelayMs: 20, maxDelayMs: 40, jitterRatio: 0 }]
   for (const retryPolicy of schedules) {
     const context = createContext()
-    apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+    apply(context, { longTermDelayMs: 60_000, defaultEnabled: true, nativeRetryFirstProviders: ['probe-provider'] })
     const started = Date.now()
     const pending = dispatchFailure(context, { ...request, retryPolicy })
     await new Promise(resolve => setTimeout(resolve, 10))
@@ -1466,7 +1576,7 @@ check('a provider with no bounded native schedule of its own answers with the in
 
 check('a provider-asked wait decides the quick retry, up to its own ceiling', async () => {
   const within = createContext()
-  apply(within, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  apply(within, { longTermDelayMs: 60_000, defaultEnabled: true, nativeRetryFirstProviders: ['probe-provider'] })
   const asked = { ...request, retryPolicy: nativePolicy(1), failure: { ...quotaFailure, providerRetryAfterMs: 30 } }
   const started = Date.now()
   assert.deepEqual(await dispatchFailure(within, asked), { kind: 'retry' })
@@ -1474,7 +1584,7 @@ check('a provider-asked wait decides the quick retry, up to its own ceiling', as
   await within.dispose()
 
   const beyond = createContext()
-  apply(beyond, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  apply(beyond, { longTermDelayMs: 60_000, defaultEnabled: true, nativeRetryFirstProviders: ['probe-provider'] })
   const tooLong = dispatchFailure(beyond, {
     ...request,
     retryPolicy: nativePolicy(5),
@@ -1488,7 +1598,7 @@ check('a provider-asked wait decides the quick retry, up to its own ceiling', as
 
 check('a native policy that already spent this step leaves the step to it', async () => {
   const context = createContext()
-  apply(context, { longTermDelayMs: 60_000, nativeRetryFirstProviders: ['probe-provider'] })
+  apply(context, { longTermDelayMs: 60_000, defaultEnabled: true, nativeRetryFirstProviders: ['probe-provider'] })
   dispatchSessionEvent(context, session, nativeRetryEvent({ retry: 7, maxRetries: 8, delayMs: 30_000 }))
 
   const budgetLeft = await dispatchFailure(context, { ...request, retryPolicy: nativePolicy(8) })
@@ -1520,8 +1630,15 @@ check('a pool named after a command word fails activation', () => {
   )
 })
 
+let failed = 0
 for (const { name, run } of checks) {
-  await run()
-  console.log(`ok  ${name}`)
+  try {
+    await run()
+    console.log(`ok  ${name}`)
+  } catch (error) {
+    failed += 1
+    console.log(`FAIL ${name}\n     ${String(error?.message ?? error).split('\n').join('\n     ')}`)
+  }
 }
-console.log(`\n${checks.length} probe checks passed`)
+console.log(`\n${checks.length - failed}/${checks.length} probe checks passed`)
+process.exitCode = failed === 0 ? 0 : 1

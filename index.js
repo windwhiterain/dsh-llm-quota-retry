@@ -101,6 +101,7 @@ import {
 import { ROUTE_CONFIG_KEYS, RouteState, resolveRoutes } from './lib/routes.js'
 import { createBalanceRegistry } from './lib/balance.js'
 import { collectProviders, createProviderCheck } from './lib/providers.js'
+import { childIdsOf, headerDelegates } from './lib/children.js'
 
 export const name = 'llm-quota-retry'
 
@@ -134,6 +135,8 @@ const PASSTHROUGH_SCHEMA = { parse: value => value }
  *   the durable settings, and the active waits.
  * @param config - row config: `longTermDelayMs` sets the interval between
  *   attempts, `defaultEnabled` sets the switch a Session starts from,
+ *   `delegatedChildren` names the Session projections whose children are delegated
+ *   work and so are switched on whatever that default says,
  *   `nativeRetryFirstProviders` names the providers whose exhausted allowance
  *   runs the native retry schedule first, `balances` describes how to read each
  *   provider's remaining allowance, and `pools` names the ordered route lists a
@@ -184,6 +187,8 @@ export function apply(ctx, config = {}, internals = {}) {
     logger: ctx.logger,
   })
   const disposeAdaptersUpdated = ctx.on('llm/adapters-updated', () => { providerCheck.observe() })
+  /** Delegating Session id -> the child Session ids its view currently names. */
+  const delegatedByParent = new Map()
   /** Session id -> the route its last request used, for failover and the chip. */
   const usedRoutes = new Map()
   /**
@@ -425,13 +430,40 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   /**
+   * Whether one Session is delegated work rather than a conversation.
+   *
+   * A subagent says so in its own header. A delegator that keeps its children
+   * looking like full sessions cannot say so there, and its children name no
+   * parent either, so the relation arrives as a Session projection and is kept
+   * from that plugin's change feed — see `lib/children.js`.
+   *
+   * @param session - the session being classified.
+   * @returns whether this Session is delegated work.
+   */
+  function isDelegatedChild(session) {
+    if (headerDelegates(session)) return true
+    if (delegatedByParent.size === 0) return false
+    for (const ids of delegatedByParent.values()) if (ids.has(session.id)) return true
+    return false
+  }
+
+  /**
    * The effective switch for one Session, resolving inheritance first.
+   *
+   * The order is the Session's own record, then whether it is delegated work, then
+   * the deployment default: a person who switched this off for a Session keeps it
+   * off whatever that Session turns out to be, and delegated work is on without
+   * every deployment opting each delegation in by hand.
+   *
    * @param session - Session whose setting is read.
    * @returns whether long-term retry is enabled for it.
    */
   function enabledForSession(session) {
     applyInheritance(session.id, session.header?.parentSession ?? null)
-    return effectiveEnabled(records.get(session.id), policy.defaultEnabled)
+    const record = records.get(session.id)
+    if (record !== undefined && record.enabled !== undefined && record.enabled !== null) return record.enabled
+    if (isDelegatedChild(session)) return true
+    return policy.defaultEnabled
   }
 
   /**
@@ -759,6 +791,14 @@ export function apply(ctx, config = {}, internals = {}) {
   })
 
   ctx.inject(['sessionProjections'], (child) => {
+    // A delegator publishes its children as a Session projection, and a child
+    // names no parent to ask, so the relation is collected from the change feed.
+    // A deployment that declares no source reads nothing.
+    child.effect(() => child.sessionProjections.onChanged((changed, key, value) => {
+      const source = policy.delegatedChildren.find(entry => entry.projectionKey === key)
+      if (source === undefined) return
+      delegatedByParent.set(changed.id, new Set(childIdsOf(value, source)))
+    }))
     child.effect(() => child.sessionProjections.register({
       key: PROJECTION_KEY,
       stateVersion: 1,
@@ -836,6 +876,24 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   /**
+   * The effective switch for a Session identified by id, which may no longer be
+   * live.
+   *
+   * The projection is folded per settings change rather than per request, so the
+   * live agent is what supplies the header and the delegated children here. A
+   * Session that is no longer live is projected from its own record and the
+   * deployment default, which is all that is knowable about it.
+   *
+   * @param sessionId - the Session being projected or reported.
+   * @returns whether long-term retry is enabled for it.
+   */
+  function enabledFor(sessionId) {
+    const session = ctx.get('agents')?.get(sessionId)?.session
+    if (session !== undefined) return enabledForSession(session)
+    return effectiveEnabled(records.get(sessionId), policy.defaultEnabled)
+  }
+
+  /**
    * Fold one Session's switch, pool, and their origins into the projection state,
    * returning the previous object when nothing observable changed (the registry's
    * change gate compares references).
@@ -849,7 +907,7 @@ export function apply(ctx, config = {}, internals = {}) {
    */
   function stateFor(sessionId, previous) {
     const record = records.get(sessionId)
-    const enabled = effectiveEnabled(record, policy.defaultEnabled)
+    const enabled = enabledFor(sessionId)
     const source = settingSource(record, policy.defaultEnabled)
     const poolSource = poolSourceOf(record)
     const setting = poolSettingOf(record)
@@ -1015,7 +1073,7 @@ export function apply(ctx, config = {}, internals = {}) {
   function report(session) {
     const record = records.get(session.id)
     const source = settingSource(record, policy.defaultEnabled)
-    const enabled = effectiveEnabled(record, policy.defaultEnabled)
+    const enabled = enabledForSession(session)
     const state = ledger.stateOf(session)
     const origin = source === 'inherited'
       ? `inherited from ${record.inheritedFrom}`

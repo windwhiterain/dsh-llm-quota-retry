@@ -13,11 +13,12 @@ allowance, the retry goes there immediately, drawn in proportion to what each
 route has left; if none has, the same request is
 retried inside the same open turn once per configured interval — one hour by
 default, with no attempt limit — until a request succeeds or the turn is
-cancelled. It is on by default for every session: turn it off per session through
-the [composer chip or `/quota-retry`](#the-per-session-switch), or for the whole
-deployment with `defaultEnabled: false`. Which route has allowance comes from
-[balance scripts](#route-pools-and-balance-sources) and from the providers that
-report exhaustion themselves.
+cancelled. It is **off** for a session that owns no setting, so this plugin never
+takes over a conversation a person is having and never redraws the model their
+picker chose: work the deployment declares to be delegated opts in on its own — see
+[`delegatedChildren`](#the-per-session-switch). Which route has allowance comes
+from [balance scripts](#route-pools-and-balance-sources) and from the providers
+that report exhaustion themselves.
 
 Any session can also be put in a pool by hand — the
 [second composer chip or `/quota-pool`](#the-per-session-route-pool) — and a
@@ -192,8 +193,24 @@ move the same switch:
   storage domain, so it survives a host restart. Without a usable storage
   domain it degrades to a process-local value instead of failing the switch.
 
-A session with no record of its own follows `defaultEnabled`, which is `true`
-unless the row sets it to `false`. A forked or delegated session takes its
+A session with no record of its own follows `defaultEnabled`, which is `false`
+unless the row sets it to `true`, with one exception: a session that **is**
+delegated work is on whatever the default says. A session is delegated work when
+its own header says so — `delegationDepth` above zero, or `origin: 'subagent'` —
+or when a delegator that keeps its children looking like full sessions publishes
+it as one of the projections `delegatedChildren` names. The order is the session's
+own record, then that, then the deployment default: a person who switched this off
+for a session keeps it off whatever that session turns out to be.
+
+A delegator that creates ordinary root sessions leaves no trace in a session
+header — that header is what makes the Client keep showing the children as full
+sessions, each with its own model picker, and it names no parent either. It
+publishes the relation as a session projection, and this plugin collects it from
+the registry's change feed, which means a view published before this row mounted
+is not in the feed: such a delegation reads as absent until its delegator
+publishes again.
+
+A forked or delegated session takes its
 nearest ancestor's explicit setting once, as a snapshot: the value applies to
 that session from then on, and `default` clears it back to the deployment
 default rather than re-inheriting.
@@ -242,7 +259,8 @@ use it.
 | Key | Default | Meaning |
 |---|---|---|
 | `longTermDelayMs` | `3600000` | Interval between long-term attempts, in milliseconds. Must be a positive finite number no greater than `2147483647`. |
-| `defaultEnabled` | `true` | The switch a session starts from before it owns a setting of its own. `false` makes the whole allowance response opt-in. |
+| `defaultEnabled` | `false` | The switch a session that owns no setting starts from. `true` opts every session in; `false` leaves the default to the delegation rule, which is what a deployment that composes subagents wants. |
+| `delegatedChildren` | none | Session projections whose published children are delegated work, and so are switched on whatever `defaultEnabled` says. Each source is `projectionKey` plus, optionally, `rowsField` (default `children`) and `sessionIdField` (default `childSessionId`). |
 | `nativeRetryFirstProviders` | none | Provider ids whose exhausted allowance runs the provider's own native retry schedule first. See [the named provider](#native-quick-retries-for-a-named-provider). |
 | `pools` | none | Named, ordered route lists a session starts on and may be moved between. Each pool is `routes` plus, optionally, `midSessionSwitch: false` to refuse the moves this plugin makes on its own once a session is running. See below. |
 | `balances` | none | One balance script per provider, reporting what it has left, plus the `apiKeyEnv` credential it runs with, the `coefficients` weighing each window it reports, the `capacities` a window the script leaves without one divides by, and the `capacity` a reading with no window divides by. See below. |
